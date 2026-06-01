@@ -1267,7 +1267,7 @@ class App(tk.Tk):
         ih = tk.Frame(hdr, bg=BG2, padx=22, pady=14); ih.pack(fill=tk.X)
         tk.Label(ih, text=APP_TITLE, bg=BG2, fg=TEXT,
                  font=("Segoe UI",16,"bold")).pack(side=tk.LEFT)
-        tk.Label(ih, text="Projects, downloads, and queued runs", bg=BG2, fg=MUTED,
+        tk.Label(ih, text="By Poleroso · Projects, downloads, and queued runs", bg=BG2, fg=MUTED,
                  font=FONT_SM).pack(side=tk.LEFT, padx=(16,0))
         tk.Frame(self, bg=ACCENT, height=2).pack(fill=tk.X)
         self.nb = ttk.Notebook(self); self.nb.pack(fill=tk.BOTH, expand=True)
@@ -2646,21 +2646,22 @@ class App(tk.Tk):
 
     # ── RUN ────────────────────────────────────────────────────────────────────
     def _run_tab(self, parent):
-        top=card(parent,"Run project",pady=20); top.pack(fill=tk.X,padx=20,pady=(20,8))
-        r1=tk.Frame(top,bg=BG2); r1.pack(fill=tk.X,pady=4)
+        _, inner = make_scrollable(parent)
+        top=card(inner,"Run project",pady=10); top.pack(fill=tk.X,padx=20,pady=(12,2))
+        r1=tk.Frame(top,bg=BG2); r1.pack(fill=tk.X,pady=1)
         tk.Label(r1,text="Project:",bg=BG2,fg=MUTED,font=FONT_SM,width=10,anchor="w").pack(side=tk.LEFT)
         self.run_proj_var=tk.StringVar()
         self.run_proj_dd=ttk.Combobox(r1,textvariable=self.run_proj_var,width=42,state="readonly"); self.run_proj_dd.pack(side=tk.LEFT,padx=(0,10))
         self._refresh_run_dd()
-        r2=tk.Frame(top,bg=BG2); r2.pack(fill=tk.X,pady=(12,0))
+        r2=tk.Frame(top,bg=BG2); r2.pack(fill=tk.X,pady=(6,0))
         self.start_btn=ttk.Button(r2,text="▶   Start",style="P.TButton",command=self._start); self.start_btn.pack(side=tk.LEFT)
         self.stop_btn=ttk.Button(r2,text="■   Stop",style="D.TButton",command=self._stop); self.stop_btn.pack(side=tk.LEFT,padx=10)
         self.stop_btn.state(["disabled"])
-        self.prog_lbl=tk.Label(parent,text="",bg=BG,fg=SUCCESS,font=FONT_B); self.prog_lbl.pack(anchor="w",padx=22,pady=(6,0))
+        self.prog_lbl=tk.Label(inner,text="",bg=BG,fg=SUCCESS,font=FONT_B)
 
-        qc=card(parent,"Activity queue",pady=12); qc.pack(fill=tk.X,padx=20,pady=(8,0))
+        qc=card(inner,"Activity queue",pady=8); qc.pack(fill=tk.X,padx=20,pady=(2,0))
         tk.Label(qc,text="The running project stays on top. Add waiting projects below it; they run one after another.",
-                 bg=BG2,fg=MUTED,font=FONT_SM).pack(anchor="w",pady=(0,8))
+                 bg=BG2,fg=MUTED,font=FONT_SM).pack(anchor="w",pady=(0,4))
         qrow=tk.Frame(qc,bg=BG2); qrow.pack(fill=tk.X)
         ttk.Button(qrow,text="Add Selected to Queue",command=self._queue_add_selected).pack(side=tk.LEFT,padx=(0,8))
         ttk.Button(qrow,text="Start Queue",style="P.TButton",command=self._queue_start).pack(side=tk.LEFT,padx=(0,8))
@@ -2670,14 +2671,14 @@ class App(tk.Tk):
         ttk.Button(qrow,text="Skip Current",style="G.TButton",command=self._queue_skip_current).pack(side=tk.LEFT,padx=(0,6))
         ttk.Button(qrow,text="Requeue Current",style="G.TButton",command=self._queue_requeue_current).pack(side=tk.LEFT,padx=(0,6))
         ttk.Button(qrow,text="Clear Queue",style="G.TButton",command=self._queue_clear).pack(side=tk.LEFT)
-        qlf=tk.Frame(qc,bg=BG2); qlf.pack(fill=tk.X,pady=(8,0))
+        qlf=tk.Frame(qc,bg=BG2); qlf.pack(fill=tk.X,pady=(5,0))
         qsb=ttk.Scrollbar(qlf); qsb.pack(side=tk.RIGHT,fill=tk.Y)
         self.queue_list=tk.Listbox(qlf,bg=BG3,fg=TEXT,font=FONT,selectbackground=ACCENT,selectforeground=BG,
                                    bd=0,height=4,yscrollcommand=qsb.set)
         self.queue_list.pack(fill=tk.X); qsb.config(command=self.queue_list.yview)
 
-        lc=card(parent,"Live log",pady=12); lc.pack(fill=tk.BOTH,expand=True,padx=20,pady=(8,20))
-        self.run_log=scrolledtext.ScrolledText(lc,bg=BG,fg=TEXT,font=MONO,insertbackground=ACCENT,bd=0,relief="flat",padx=10,pady=8)
+        lc=card(inner,"Live log",pady=10); lc.pack(fill=tk.BOTH,expand=True,padx=20,pady=(4,20))
+        self.run_log=scrolledtext.ScrolledText(lc,bg=BG,fg=TEXT,font=MONO,insertbackground=ACCENT,bd=0,relief="flat",padx=10,pady=8,height=34)
         self.run_log.pack(fill=tk.BOTH,expand=True)
         self.run_log.tag_config("g", foreground=SUCCESS)
         self.run_log.tag_config("r", foreground=DANGER)
@@ -2888,17 +2889,38 @@ class App(tk.Tk):
         if self.active_task == "download":
             self._log_d("Stop requested...", "r")
 
+    def _log_should_follow(self, widget):
+        try:
+            return widget.yview()[1] >= 0.98
+        except Exception:
+            return True
+
+    def _log_finish(self, widget, should_follow):
+        if should_follow:
+            widget.see(tk.END)
+
+    def _set_progress(self, text):
+        if not hasattr(self, "prog_lbl"):
+            return
+        self.prog_lbl.config(text=text)
+        if text and not self.prog_lbl.winfo_manager():
+            self.prog_lbl.pack(anchor="w", padx=22, pady=(2,0))
+
     def _log_r(self,msg,tag=""):
-        self.run_log.insert(tk.END,msg+"\n",tag); self.run_log.see(tk.END)
+        follow = self._log_should_follow(self.run_log)
+        self.run_log.insert(tk.END,msg+"\n",tag)
+        self._log_finish(self.run_log, follow)
 
     def _log_d(self, msg, tag=""):
         if hasattr(self, "download_log"):
+            follow = self._log_should_follow(self.download_log)
             self.download_log.insert(tk.END, msg + "\n", tag)
-            self.download_log.see(tk.END)
+            self._log_finish(self.download_log, follow)
 
     def _log_download_live_status(self, msg):
         if not hasattr(self, "download_log"):
             return
+        follow = self._log_should_follow(self.download_log)
         if not hasattr(self, "_download_live_mark"):
             self._download_live_mark = "download_live_status"
         mark = self._download_live_mark
@@ -2913,7 +2935,8 @@ class App(tk.Tk):
             self.download_log.mark_set(mark, tk.END)
             self.download_log.mark_gravity(mark, tk.LEFT)
             self.download_log.insert(tk.END, "◉  " + msg + "\n", "status")
-        self.download_log.see(mark)
+        if follow:
+            self.download_log.see(mark)
 
     def _clear_download_live_status(self):
         if hasattr(self, "download_log") and hasattr(self, "_download_live_mark"):
@@ -2949,9 +2972,10 @@ class App(tk.Tk):
             ("\n", ""),
         ]
         if hasattr(self, "download_log"):
+            follow = self._log_should_follow(self.download_log)
             for text, tag in parts:
                 self.download_log.insert(tk.END, text, tag)
-            self.download_log.see(tk.END)
+            self._log_finish(self.download_log, follow)
 
     def _log_progress_r(self, msg):
         m = re.match(
@@ -2979,9 +3003,10 @@ class App(tk.Tk):
             (m.group("run"), "copied"),
             ("\n", ""),
         ]
+        follow = self._log_should_follow(self.run_log)
         for text, tag in parts:
             self.run_log.insert(tk.END, text, tag)
-        self.run_log.see(tk.END)
+        self._log_finish(self.run_log, follow)
 
     # ── Poll ───────────────────────────────────────────────────────────────────
     def _poll(self):
@@ -3011,13 +3036,13 @@ class App(tk.Tk):
                     if self.active_task == "download": self._log_d("✗  " + msg, "r")
                 elif msg.startswith("Download progress:"):
                     self._log_download_progress(msg)
-                    self.prog_lbl.config(text=msg)
+                    self._set_progress(msg)
                 elif msg.startswith("DOWNLOAD_STATUS "):
                     clean = msg[len("DOWNLOAD_STATUS "):]
                     if hasattr(self, "d_status_lbl"):
                         self.d_status_lbl.config(text=clean, fg=ACCENT)
                     self._log_download_live_status(clean)
-                    self.prog_lbl.config(text=clean)
+                    self._set_progress(clean)
                 elif any(x in msg for x in ("Download destination:", "Download pending:", "Download items this run:", "Download size:", "Counting download items")):
                     self._log_d(msg, "d")
                     self._log_r(msg, "d")
@@ -3034,16 +3059,16 @@ class App(tk.Tk):
                     self._log_d(("✓  " if tag == "g" else "▶  ") + msg, tag)
                     self._log_r(("✓  " if tag == "g" else "▶  ") + msg, tag)
                 elif "Progress:" in msg:
-                    self._log_progress_r(msg); self.prog_lbl.config(text=msg)
+                    self._log_progress_r(msg); self._set_progress(msg)
                 elif msg.startswith("STATUS "):
                     clean = msg[7:]  # strip "STATUS "
-                    self._log_r("◉  " + clean, "g"); self.prog_lbl.config(text=clean)
+                    self._log_r("◉  " + clean, "g"); self._set_progress(clean)
                 elif "Skipping duplicate" in msg:
                     self._log_r("⊘  " + msg, "y")
                 elif "WARNING" in msg:
                     self._log_r("⚠  " + msg, "y")
                 elif any(x in msg for x in ("Done.", "complete", "All mappings")):
-                    self._log_r("✓  " + msg, "g"); self.prog_lbl.config(text=msg)
+                    self._log_r("✓  " + msg, "g"); self._set_progress(msg)
                 elif any(x in msg for x in ("Flood wait","flood")):
                     self._log_r("⏸  " + msg, "y")
                 elif any(x in msg for x in ("Logged in","Connected","✓")):

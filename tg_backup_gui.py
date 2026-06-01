@@ -130,10 +130,84 @@ def list_topics(api_id, api_hash, group_id, log_q, result_q):
                 offset_topic = last.id
                 offset_id = getattr(last, 'top_message', 0) or 0
                 offset_date = getattr(last, 'date', None)
+            topic_by_id = {int(t["id"]): t for t in topics}
+            try:
+                cfg = load_config()
+                known = {}
+                for project in cfg.get("projects", []):
+                    for route in project.get("routes", []):
+                        if int(route.get("src_group_id", 0) or 0) == int(group_id):
+                            known[int(route.get("src_topic_id", 1))] = route.get("src_topic_title") or f"Topic {route.get('src_topic_id', 1)}"
+                        if int(route.get("dest_group_id", 0) or 0) == int(group_id) and route.get("dest_topic_id"):
+                            known[int(route.get("dest_topic_id"))] = route.get("dest_topic_title") or f"Topic {route.get('dest_topic_id')}"
+                for tid, saved_title in known.items():
+                    if tid == 1:
+                        continue
+                    current = topic_by_id.get(tid, {"id": tid, "title": saved_title})
+                    if tid not in topic_by_id or _is_generic_topic_title(current.get("title"), tid):
+                        try:
+                            msg = await c.get_messages(group_id, ids=tid)
+                            action = getattr(msg, "action", None) if msg else None
+                            real_title = getattr(action, "title", None)
+                            if real_title:
+                                current["title"] = real_title
+                        except Exception:
+                            pass
+                    topic_by_id[tid] = current
+                topics = sorted(topic_by_id.values(), key=lambda t: (t.get("title", "").lower(), int(t.get("id", 0))))
+            except Exception:
+                pass
             result_q.put(topics)
         except Exception as e:
             log_q.put(f"Could not load topics: {e}")
             result_q.put(None)
+        finally:
+            await c.disconnect()
+    _new_loop(_r())
+
+def resolve_route_topic_names(api_id, api_hash, routes, log_q, result_q):
+    async def _r():
+        try:
+            from telethon import TelegramClient
+            from telethon.tl.types import MessageActionTopicCreate
+        except ImportError:
+            result_q.put({"kind": "route_topic_names", "updates": []}); return
+        c = TelegramClient("session_gui", api_id, api_hash)
+        try:
+            await c.connect()
+            updates = []
+            cache = {}
+            async def title_for(group_id, topic_id):
+                key = (int(group_id), int(topic_id))
+                if key in cache:
+                    return cache[key]
+                title = None
+                try:
+                    msg = await c.get_messages(group_id, ids=topic_id)
+                    action = getattr(msg, "action", None) if msg else None
+                    title = getattr(action, "title", None)
+                    if not title and isinstance(action, MessageActionTopicCreate):
+                        title = getattr(action, "title", None)
+                except Exception:
+                    title = None
+                cache[key] = title
+                return title
+            for idx, route in enumerate(routes):
+                src_title = route.get("src_topic_title", "")
+                dst_title = route.get("dest_topic_title", "")
+                update = {"idx": idx}
+                if _is_generic_topic_title(src_title, route.get("src_topic_id", 1)):
+                    title = await title_for(route["src_group_id"], route.get("src_topic_id", 1))
+                    if title: update["src_topic_title"] = title
+                if route.get("dest_topic_id") and _is_generic_topic_title(dst_title, route.get("dest_topic_id")):
+                    title = await title_for(route["dest_group_id"], route.get("dest_topic_id"))
+                    if title: update["dest_topic_title"] = title
+                if len(update) > 1:
+                    updates.append(update)
+            result_q.put({"kind": "route_topic_names", "updates": updates})
+        except Exception as e:
+            log_q.put(f"Could not resolve topic names: {e}")
+            result_q.put({"kind": "route_topic_names", "updates": []})
         finally:
             await c.disconnect()
     _new_loop(_r())
@@ -254,6 +328,10 @@ def _get_sz(media):
 def _is_dup(sent_files, tid, fn, sz):
     if not fn or not sz: return False
     return sent_files.get(str(tid), {}).get(fn) == sz
+
+def _is_generic_topic_title(title, topic_id):
+    title = (title or "").strip()
+    return not title or title == f"Topic {topic_id}"
 
 def _track(sent_files, tid, fn, sz):
     if not fn or not sz: return
@@ -687,6 +765,7 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
             log_q.put("No saved state - starting fresh")
 
         created_topics = state.setdefault("__created_topics", {})
+        dest_files = state.setdefault("__dest_files", {})
 
         def save_state():
             with open(state_file, "w", encoding="utf-8") as f:
@@ -747,6 +826,29 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                 count += 1
             return count
 
+        async def scan_dest_topic_files(client, group_id, topic_id, topic_title):
+            group_files = dest_files.setdefault(str(group_id), {})
+            topic_files = group_files.setdefault(str(topic_id), {})
+            before = len(topic_files)
+            scanned = 0
+            log_q.put(f"Scanning destination topic: {topic_title}")
+            msg_iter = client.iter_messages(group_id, reverse=True, reply_to=topic_id)
+            async for msg in msg_iter:
+                if stop_event.is_set():
+                    break
+                media = getattr(msg, "media", None)
+                fn = _get_fn(media) if media else None
+                sz = _get_sz(media) if media else None
+                if fn and sz:
+                    topic_files[fn] = sz
+                    scanned += 1
+                    if scanned % 500 == 0:
+                        log_q.put(f"  scanned {scanned} file(s) in {topic_title}...")
+            added = len(topic_files) - before
+            save_state()
+            log_q.put(f"Scanned destination topic: {topic_title} — {len(topic_files)} existing file(s), {added} new to index")
+            return group_files
+
         async def ensure_dest_topic(client, route):
             dest_id = route.get("dest_topic_id")
             if dest_id:
@@ -776,6 +878,7 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
 
             prepared = []
             total_remaining = 0
+            scanned_dest_keys = set()
             log_q.put("Preparing routes...")
             for route in routes:
                 if stop_event.is_set(): break
@@ -785,6 +888,14 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                 if src_forum is None:
                     src_forum = await source_has_topics(client, route["src_group_id"])
                 await enrich_route_names(client, route, src_forum, dest_topic_id)
+                if filters.get("skip_duplicates", True):
+                    dest_key = f"{route['dest_group_id']}_{dest_topic_id}"
+                    if dest_key not in scanned_dest_keys:
+                        await scan_dest_topic_files(
+                            client, route["dest_group_id"], dest_topic_id,
+                            route.get("dest_topic_title") or f"Topic {dest_topic_id}"
+                        )
+                        scanned_dest_keys.add(dest_key)
                 key = f"{route['src_group_id']}_{src_topic_id}_{route['dest_group_id']}_{dest_topic_id}"
                 ms = state.setdefault(key, {"last_msg_id":0,"sent_files":{}})
                 last_id = ms.get("last_msg_id", 0)
@@ -802,6 +913,7 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                 src_topic_id = route.get("src_topic_id", 1)
                 last_id = ms.get("last_msg_id", 0)
                 sent_files = ms.setdefault("sent_files", {})
+                destination_sent_files = dest_files.setdefault(str(route["dest_group_id"]), {})
                 route_label = f"{route.get('src_group_name','?')} / {route.get('src_topic_title','General')} -> {route.get('dest_group_name','?')} / {route.get('dest_topic_title','?')}"
                 progress_label = route_label.replace(" -> ", " → ")
                 log_q.put(f"\n▶  Route: {route_label}")
@@ -836,11 +948,14 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                             kwargs = {"reply_to": dest_topic_id}
                             if media:
                                 fn = _get_fn(media); sz = _get_sz(media)
-                                if filters.get("skip_duplicates", True) and _is_dup(sent_files, dest_topic_id, fn, sz):
+                                dup_in_route = _is_dup(sent_files, dest_topic_id, fn, sz)
+                                dup_in_dest = _is_dup(destination_sent_files, dest_topic_id, fn, sz)
+                                if filters.get("skip_duplicates", True) and (dup_in_route or dup_in_dest):
                                     skipped += 1; route_skipped += 1
                                 else:
                                     await safe(lambda: client.send_file(route["dest_group_id"], media, caption=text, **kwargs))
                                     _track(sent_files, dest_topic_id, fn, sz)
+                                    _track(destination_sent_files, dest_topic_id, fn, sz)
                                     copied += 1; route_copied += 1
                             elif text:
                                 await safe(lambda: client.send_message(route["dest_group_id"], text, **kwargs))
@@ -1170,10 +1285,10 @@ def run_download_topics(api_id, api_hash, source_id, source_name, output_dir, to
     _new_loop(_r())
 
 
-BG="#0f1923";BG2="#1a2635";BG3="#243447";ACCENT="#4fc3f7";SUCCESS="#69f0ae"
-WARNING="#ffd740";DANGER="#ff5252";TEXT="#e8eaf0";MUTED="#78909c"
-FONT=("Segoe UI",10);FONT_SM=("Segoe UI",9);FONT_B=("Segoe UI",10,"bold")
-FONT_H=("Segoe UI",11,"bold");MONO=("Consolas",9)
+BG="#0f1923";BG2="#1a2635";BG3="#1f2d3d";ACCENT="#4fc3f7";SUCCESS="#69f0ae"
+WARNING="#ffd740";DANGER="#ff5252";TEXT="#e8eaf0";MUTED="#546e7a"
+FONT=("Segoe UI",10,"bold");FONT_SM=("Segoe UI",9,"bold");FONT_B=("Segoe UI",10,"bold")
+FONT_H=("Segoe UI",11,"bold");FONT_TREE=("Segoe UI",10,"bold");MONO=("Consolas",9)
 APP_NAME = "Telegram Group Backup & Download"
 APP_VERSION = "v1.0"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
@@ -1253,6 +1368,11 @@ class App(tk.Tk):
         s.configure("TEntry", fieldbackground=BG3, foreground=TEXT, insertcolor=ACCENT, font=FONT, padding=6)
         s.configure("TCombobox", fieldbackground=BG3, foreground=TEXT, selectbackground=BG3, selectforeground=TEXT, font=FONT, padding=5)
         s.map("TCombobox", fieldbackground=[("readonly",BG3)], foreground=[("readonly",TEXT)])
+        s.configure("Treeview", background=BG3, fieldbackground=BG3, foreground=TEXT,
+                    font=FONT_TREE, rowheight=26, borderwidth=0)
+        s.configure("Treeview.Heading", background=BG2, foreground=TEXT,
+                    font=FONT_B, relief="flat")
+        s.map("Treeview", background=[("selected",ACCENT)], foreground=[("selected",BG)])
         s.configure("P.TButton", background=ACCENT, foreground=BG, font=FONT_B, padding=[14,8], borderwidth=0)
         s.configure("TButton", background=BG3, foreground=TEXT, font=FONT, padding=[12,7], borderwidth=0)
         s.configure("D.TButton", background=DANGER, foreground="white", font=FONT_B, padding=[12,7], borderwidth=0)
@@ -1523,6 +1643,8 @@ class App(tk.Tk):
                    command=self._builder_use_existing_selected).pack(side=tk.LEFT, padx=(0,8))
         ttk.Button(abar, text="Create",
                    command=self._builder_create_for_selected).pack(side=tk.LEFT, padx=(0,8))
+        ttk.Button(abar, text="Clear Destination",
+                   command=self._builder_clear_destination_selected).pack(side=tk.LEFT, padx=(0,8))
         ttk.Button(abar, text="Delete Selected",
                    style="G.TButton", command=self._builder_remove_selected).pack(side=tk.LEFT)
 
@@ -1546,6 +1668,14 @@ class App(tk.Tk):
         self.b_routes_tree.column("status", width=130, anchor="w")
         self.b_routes_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.b_routes_tree.tag_configure("needs_parent", foreground=DANGER, font=FONT_TREE)
+        self.b_routes_tree.tag_configure("suggest_parent", foreground=WARNING, font=FONT_TREE)
+        self.b_routes_tree.tag_configure("review_parent", foreground=WARNING, font=FONT_TREE)
+        self.b_routes_tree.tag_configure("ready_parent", foreground=TEXT, font=FONT_TREE)
+        self.b_routes_tree.tag_configure("needs", foreground=DANGER, font=FONT_TREE)
+        self.b_routes_tree.tag_configure("suggestion", foreground=WARNING, font=FONT_TREE)
+        self.b_routes_tree.tag_configure("review", foreground=WARNING, font=FONT_TREE)
+        self.b_routes_tree.tag_configure("ready", foreground=TEXT, font=FONT_TREE)
         self.b_routes_tree.bind("<Double-1>", lambda e: self._builder_use_existing_selected())
         self.b_routes_tree.bind("<Delete>", lambda e: self._builder_remove_selected())
         self.b_routes_tree.bind("<MouseWheel>", self._builder_tree_mousewheel)
@@ -1620,12 +1750,15 @@ class App(tk.Tk):
             if isinstance(r, list):
                 if which == "dest":
                     self._b_dest_topics = r
+                    self._builder_merge_known_dest_topics()
+                    self._builder_apply_topic_names("dest", r)
                     if hasattr(self, 'b_dest_status'):
                         self.b_dest_status.config(
                             text=f"✓  {len(r)} destination topics loaded.", fg=SUCCESS)
                     self._builder_redraw()
                 else:
                     self._b_src_topics = r
+                    self._builder_apply_topic_names("src", r)
                     self.b_src_topic_combo["values"] = [self._topic_display(t) for t in r]
                     if r[0]["id"] == 1 and len(r) == 1:
                         # No topics — auto-check whole group
@@ -1639,6 +1772,96 @@ class App(tk.Tk):
                                 text=f"✓  {len(r)} topics loaded.", fg=SUCCESS)
         except queue.Empty:
             self.after(500, lambda: self._builder_chk_topics(which))
+
+    def _builder_apply_topic_names(self, which, topics):
+        by_id = {int(t["id"]): t["title"] for t in topics}
+        changed = 0
+        for route in self._b_routes:
+            if which == "src" and int(route.get("src_topic_id", 1)) in by_id:
+                new_title = by_id[int(route.get("src_topic_id", 1))]
+                if route.get("src_topic_title") != new_title:
+                    route["src_topic_title"] = new_title; changed += 1
+            elif which == "dest" and route.get("dest_topic_id") and int(route.get("dest_topic_id")) in by_id:
+                new_title = by_id[int(route.get("dest_topic_id"))]
+                if route.get("dest_topic_title") != new_title:
+                    route["dest_topic_title"] = new_title; changed += 1
+        if changed:
+            self._builder_redraw()
+
+    def _builder_merge_known_dest_topics(self):
+        if not self._b_dest_group_id:
+            return
+        by_id = {int(t["id"]): dict(t) for t in self._b_dest_topics if t.get("id")}
+        for project in self.config_data.get("projects", []):
+            for route in project.get("routes", []):
+                if int(route.get("dest_group_id", 0) or 0) != int(self._b_dest_group_id):
+                    continue
+                tid = route.get("dest_topic_id")
+                if not tid:
+                    continue
+                tid = int(tid)
+                title = route.get("dest_topic_title") or f"Topic {tid}"
+                if _is_generic_topic_title(title, tid):
+                    src_title = route.get("src_topic_title")
+                    if src_title and not _is_generic_topic_title(src_title, route.get("src_topic_id", 1)):
+                        title = src_title
+                current = by_id.get(tid)
+                if not current or _is_generic_topic_title(current.get("title"), tid):
+                    by_id[tid] = {"id": tid, "title": title}
+        for route in self._b_routes:
+            tid = route.get("dest_topic_id")
+            if not tid:
+                continue
+            tid = int(tid)
+            title = route.get("dest_topic_title") or f"Topic {tid}"
+            if _is_generic_topic_title(title, tid):
+                src_title = route.get("src_topic_title")
+                if src_title and not _is_generic_topic_title(src_title, route.get("src_topic_id", 1)):
+                    title = src_title
+            current = by_id.get(tid)
+            if not current or _is_generic_topic_title(current.get("title"), tid):
+                by_id[tid] = {"id": tid, "title": title}
+        self._b_dest_topics = sorted(by_id.values(), key=lambda t: (t.get("title", "").lower(), int(t.get("id", 0))))
+
+    def _builder_resolve_generic_names(self):
+        if not self._b_routes:
+            return
+        needs_names = any(
+            _is_generic_topic_title(r.get("src_topic_title"), r.get("src_topic_id", 1)) or
+            (r.get("dest_topic_id") and _is_generic_topic_title(r.get("dest_topic_title"), r.get("dest_topic_id")))
+            for r in self._b_routes
+        )
+        if not needs_names or self.backup_running:
+            return
+        self._log_s("Resolving topic names from Telegram...")
+        threading.Thread(target=lambda: resolve_route_topic_names(
+            int(self.api_id_var.get()), self.api_hash_var.get(), [dict(r) for r in self._b_routes],
+            self.log_queue, self.result_queue), daemon=True).start()
+        self.after(500, self._builder_chk_resolved_names)
+
+    def _builder_chk_resolved_names(self):
+        try:
+            r = self.result_queue.get_nowait()
+            if not isinstance(r, dict) or r.get("kind") != "route_topic_names":
+                self.result_queue.put(r)
+                self.after(500, self._builder_chk_resolved_names)
+                return
+            changed = 0
+            for update in r.get("updates", []):
+                idx = update.get("idx")
+                if idx is None or idx >= len(self._b_routes):
+                    continue
+                route = self._b_routes[idx]
+                for key in ("src_topic_title", "dest_topic_title"):
+                    if update.get(key) and route.get(key) != update[key]:
+                        route[key] = update[key]; changed += 1
+            if changed:
+                self._builder_redraw()
+                self._log_s(f"Resolved {changed} topic name(s).")
+            else:
+                self._log_s("No extra topic names resolved.")
+        except queue.Empty:
+            self.after(500, self._builder_chk_resolved_names)
 
     def _builder_add_bucket(self):
         if self._telegram_busy("create a topic"):
@@ -1773,11 +1996,15 @@ class App(tk.Tk):
         if not sel:
             return []
         route_map = getattr(self, "_b_tree_routes", {})
+        group_map = getattr(self, "_b_tree_group_routes", {})
         routes = []
         for item in sel:
             route = route_map.get(item)
             if route and route not in routes:
                 routes.append(route)
+            for child_route in group_map.get(item, []):
+                if child_route not in routes:
+                    routes.append(child_route)
         return routes
 
     def _builder_tree_mousewheel(self, event):
@@ -1786,26 +2013,26 @@ class App(tk.Tk):
         return "break"
 
     def _builder_use_existing_selected(self):
-        route = self._builder_selected_route()
-        if not route:
-            messagebox.showinfo("", "Select a source route first."); return
-        self._builder_choose_existing(route)
+        routes = self._builder_selected_routes()
+        if not routes:
+            messagebox.showinfo("", "Select one or more source routes first."); return
+        self._builder_choose_existing(routes)
 
     def _builder_create_for_selected(self):
-        route = self._builder_selected_route()
-        if not route:
-            messagebox.showinfo("", "Select a source route first."); return
+        routes = self._builder_selected_routes()
+        if not routes:
+            messagebox.showinfo("", "Select one or more source routes first."); return
         if not self._b_dest_group_id:
             messagebox.showerror("", "Load destination topics first."); return
         title = simpledialog.askstring(
             "Create destination topic",
             "New destination topic name:",
-            initialvalue=route.get("src_topic_title", ""),
+            initialvalue=routes[0].get("src_topic_title", ""),
             parent=self
         )
         if not title:
             return
-        self._b_pending_create_route = route
+        self._b_pending_create_routes = routes
         ai = self.api_id_var.get(); ah = self.api_hash_var.get()
         threading.Thread(target=lambda: create_topic_in_group(
             int(ai), ah, self._b_dest_group_id, title.strip(),
@@ -1815,61 +2042,136 @@ class App(tk.Tk):
     def _builder_chk_created_for_route(self):
         try:
             r = self.result_queue.get_nowait()
-            route = getattr(self, "_b_pending_create_route", None)
-            self._b_pending_create_route = None
-            if r and route:
+            routes = getattr(self, "_b_pending_create_routes", [])
+            self._b_pending_create_routes = []
+            if r and routes:
                 self._b_dest_topics.append(r)
-                route["dest_topic_id"] = r["id"]
-                route["dest_topic_title"] = r["title"]
-                route["dest_topic_action"] = "create"
-                route["accepted"] = True
-                route["confidence"] = "manual"
-                self._log_s(f"Topic '{r['title']}' created and assigned.")
+                for route in routes:
+                    route["dest_topic_id"] = r["id"]
+                    route["dest_topic_title"] = r["title"]
+                    route["dest_topic_action"] = "create"
+                    route["accepted"] = True
+                    route["confidence"] = "manual"
+                self._log_s(f"Topic '{r['title']}' created and assigned to {len(routes)} route(s).")
                 self._builder_redraw()
             else:
                 messagebox.showerror("Error", "Could not create topic.")
         except queue.Empty:
             self.after(500, self._builder_chk_created_for_route)
 
-    def _builder_choose_existing(self, route):
+    def _builder_clear_destination_selected(self):
+        routes = self._builder_selected_routes()
+        if not routes:
+            messagebox.showinfo("", "Select one or more source routes first."); return
+        if not messagebox.askyesno("Clear destination", f"Remove destination from {len(routes)} route(s)?"):
+            return
+        for route in routes:
+            route["dest_topic_id"] = None
+            route["dest_topic_title"] = None
+            route["dest_topic_action"] = "use"
+            route["accepted"] = False
+            route["confidence"] = None
+        self._builder_redraw()
+
+    def _builder_choose_existing(self, routes):
+        if isinstance(routes, dict):
+            routes = [routes]
+        route = routes[0]
         d = tk.Toplevel(self)
         d.title("Use Existing")
         d.configure(bg=BG2)
-        d.geometry("500x260")
-        d.resizable(False, False)
+        d.geometry("620x520")
+        d.minsize(520, 420)
         d.grab_set()
 
         src_txt = f"{route['src_group_name']} / {route['src_topic_title']}"
-        tk.Label(d, text="Source topic", bg=BG2, fg=MUTED, font=FONT_SM).pack(anchor="w", padx=16, pady=(16,0))
-        tk.Label(d, text=src_txt, bg=BG2, fg=TEXT, font=FONT_B).pack(anchor="w", padx=16, pady=(0,12))
+        label = "Source topic" if len(routes) == 1 else f"{len(routes)} source topics selected"
+        tk.Label(d, text=label, bg=BG2, fg=MUTED, font=FONT_SM).pack(anchor="w", padx=16, pady=(16,0))
+        tk.Label(d, text=src_txt if len(routes) == 1 else "The chosen destination will be applied to all selected routes.",
+                 bg=BG2, fg=TEXT, font=FONT_B).pack(anchor="w", padx=16, pady=(0,8))
 
         suggested = route.get("dest_topic_title") if route.get("confidence") == "suggested" else ""
         if suggested:
-            tk.Label(d, text=f"Suggested: {suggested}", bg=BG2, fg=WARNING, font=FONT_SM).pack(anchor="w", padx=16, pady=(0,8))
+            tk.Label(d, text=f"Suggested: {suggested}", bg=BG2, fg=WARNING, font=FONT_SM).pack(anchor="w", padx=16, pady=(0,6))
 
-        tk.Label(d, text="Use existing destination topic:", bg=BG2, fg=TEXT, font=FONT).pack(anchor="w", padx=16, pady=(0,4))
-        dest_var = tk.StringVar(value=route.get("dest_topic_title") or suggested)
-        cb = ttk.Combobox(d, textvariable=dest_var, width=44, state="readonly")
-        cb["values"] = [t["title"] for t in self._b_dest_topics]
-        cb.pack(padx=16, pady=(0,16))
+        self._builder_merge_known_dest_topics()
+        tk.Label(d, text="Search existing destination topics:", bg=BG2, fg=TEXT, font=FONT).pack(anchor="w", padx=16, pady=(0,4))
+        search_var = tk.StringVar(value=route.get("dest_topic_title") or suggested or "")
+        search = ttk.Entry(d, textvariable=search_var)
+        search.pack(fill=tk.X, padx=16, pady=(0,8))
+
+        topics = sorted(self._b_dest_topics, key=lambda t: (t.get("title", "").lower(), int(t.get("id", 0))))
+        current_view = []
+        list_frame = tk.Frame(d, bg=BG2); list_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0,10))
+        sb = ttk.Scrollbar(list_frame); sb.pack(side=tk.RIGHT, fill=tk.Y)
+        lb = tk.Listbox(list_frame, bg=BG3, fg=TEXT, font=FONT, selectbackground=ACCENT,
+                        selectforeground=BG, bd=0, activestyle="none", height=14,
+                        exportselection=False, yscrollcommand=sb.set)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True); sb.config(command=lb.yview)
+        status = tk.Label(d, text="", bg=BG2, fg=MUTED, font=FONT_SM)
+        status.pack(anchor="w", padx=16, pady=(0,4))
+        selected_topic = {"topic": None}
+
+        def _display(topic):
+            return f"{topic['title']}  (id:{topic['id']})"
+
+        def _filter(*_):
+            nonlocal current_view
+            q = search_var.get().strip().lower()
+            current_view = [
+                t for t in topics
+                if not q or q in t.get("title", "").lower() or q in str(t.get("id", ""))
+            ]
+            lb.delete(0, tk.END)
+            for t in current_view:
+                lb.insert(tk.END, _display(t))
+            if current_view:
+                lb.select_set(0)
+                lb.activate(0)
+                lb.see(0)
+                selected_topic["topic"] = current_view[0]
+            else:
+                selected_topic["topic"] = None
+            status.config(text=f"{len(current_view)}/{len(topics)} topic(s)")
+
+        search_var.trace_add("write", _filter)
+
+        def _remember_selection(*_):
+            idxs = lb.curselection()
+            if idxs and idxs[0] < len(current_view):
+                selected_topic["topic"] = current_view[idxs[0]]
+
+        lb.bind("<<ListboxSelect>>", _remember_selection)
 
         def _use():
-            sel = dest_var.get()
-            t = next((t for t in self._b_dest_topics if t["title"] == sel), None)
+            _remember_selection()
+            idxs = lb.curselection()
+            t = selected_topic.get("topic")
+            if idxs and idxs[0] < len(current_view):
+                t = current_view[idxs[0]]
+            if not t:
+                q = search_var.get().strip().lower()
+                exact = [x for x in current_view if x.get("title", "").lower() == q or str(x.get("id")) == q]
+                t = exact[0] if exact else (current_view[0] if len(current_view) == 1 else None)
             if not t: messagebox.showerror("", "Select a destination topic."); return
-            old = route.get("dest_topic_title")
-            route["dest_topic_id"] = t["id"]
-            route["dest_topic_title"] = t["title"]
-            route["dest_topic_action"] = "use"
-            route["accepted"] = True
-            if t["title"] != old or route.get("confidence") != "exact":
-                route["confidence"] = "manual"
+            for route in routes:
+                old = route.get("dest_topic_title")
+                route["dest_topic_id"] = t["id"]
+                route["dest_topic_title"] = t["title"]
+                route["dest_topic_action"] = "use"
+                route["accepted"] = True
+                if t["title"] != old or route.get("confidence") != "exact":
+                    route["confidence"] = "manual"
             self._builder_redraw(); d.destroy()
 
         br = tk.Frame(d, bg=BG2); br.pack(pady=4)
         ttk.Button(br, text="Use Existing", style="P.TButton", command=_use).pack(side=tk.LEFT, padx=4)
         ttk.Button(br, text="Cancel", style="G.TButton", command=d.destroy).pack(side=tk.LEFT, padx=4)
         d.bind("<Return>", lambda e: _use())
+        lb.bind("<Double-1>", lambda e: _use())
+        search.focus()
+        search.select_range(0, tk.END)
+        _filter()
 
     def _builder_redraw(self):
         if not hasattr(self, 'b_routes_tree'):
@@ -1879,45 +2181,68 @@ class App(tk.Tk):
         for item in tree.get_children():
             tree.delete(item)
         self._b_tree_routes = {}
+        self._b_tree_group_routes = {}
 
-        unassigned = [r for r in self._b_routes if not r.get("dest_topic_id")]
-        assigned   = [r for r in self._b_routes if r.get("dest_topic_id")]
+        def route_status(route):
+            if not route.get("dest_topic_id"):
+                return "Choose destination", "needs", 0
+            if route.get("accepted"):
+                return "Ready", "ready", 3
+            if route.get("confidence") == "suggested":
+                return "Suggestion - approve", "suggestion", 1
+            return "Review", "review", 2
 
         buckets = {}
-        for r in assigned:
-            key = (r["dest_topic_title"], r.get("dest_topic_id"))
-            buckets.setdefault(key, []).append(r)
-        if unassigned:
-            buckets[("Needs destination", None)] = unassigned
+        for r in self._b_routes:
+            status, tag, priority = route_status(r)
+            if not r.get("dest_topic_id"):
+                key = ("Needs destination", None)
+            elif tag == "suggestion":
+                key = ("Suggestions to approve", "__suggestions__")
+            elif tag == "review":
+                key = ("Needs review", "__review__")
+            else:
+                key = (r.get("dest_topic_title", ""), r.get("dest_topic_id"))
+            bucket = buckets.setdefault(key, {"routes": [], "priority": priority, "tag": tag})
+            bucket["routes"].append(r)
+            bucket["priority"] = min(bucket["priority"], priority)
+            if priority < {"needs": 0, "suggestion": 1, "review": 2, "ready": 3}.get(bucket["tag"], 3):
+                bucket["tag"] = tag
 
         if not self._b_routes:
             tree.insert("", "end", text="No routes yet", values=("Add source topics above", "", ""))
         else:
-            for (title, tid), routes in sorted(buckets.items(), key=lambda x: (x[0][0] != "Needs destination", x[0][0].lower())):
+            def bucket_sort(item):
+                (title, _), data = item
+                return (data["priority"], title.lower())
+            for (title, tid), data in sorted(buckets.items(), key=bucket_sort):
+                routes = data["routes"]
+                parent_tag = {
+                    "needs": "needs_parent",
+                    "suggestion": "suggest_parent",
+                    "review": "review_parent",
+                    "ready": "ready_parent",
+                }.get(data["tag"], "")
                 parent = tree.insert("", "end", text=title, open=True,
-                                     values=("", f"{len(routes)} source(s)", ""))
+                                     values=("", f"{len(routes)} source(s)", ""),
+                                     tags=(parent_tag,))
+                self._b_tree_group_routes[parent] = list(routes)
                 for r in sorted(routes, key=lambda x: (x["src_group_name"].lower(), x["src_topic_title"].lower())):
+                    status, row_tag, _priority = route_status(r)
                     if not r.get("dest_topic_id"):
                         dest = ""
-                        status = "Choose destination"
-                    elif r.get("accepted"):
-                        dest = r.get("dest_topic_title", "")
-                        status = "Ready"
-                    elif r.get("confidence") == "suggested":
-                        dest = r.get("dest_topic_title", "")
-                        status = "Suggestion"
                     else:
                         dest = r.get("dest_topic_title", "")
-                        status = "Review"
                     iid = tree.insert(parent, "end",
                                       text="",
-                                      values=(f"{r['src_group_name']} / {r['src_topic_title']}", dest, status))
+                                      values=(f"{r['src_group_name']} / {r['src_topic_title']}", dest, status),
+                                      tags=(row_tag,))
                     self._b_tree_routes[iid] = r
 
         # Update status label
         total = len(self._b_routes)
         accepted = sum(1 for r in self._b_routes if r.get("accepted"))
-        n_unassigned = len(unassigned)
+        n_unassigned = sum(1 for r in self._b_routes if not r.get("dest_topic_id"))
         pending = total - accepted - n_unassigned
 
         if total == 0:
@@ -1965,6 +2290,8 @@ class App(tk.Tk):
         if hasattr(self, 'b_dest_status'):
             self.b_dest_status.config(
                 text=f"Loaded from project — {len(self._b_dest_topics)} dest topics known.", fg=ACCENT)
+        self._builder_merge_known_dest_topics()
+        self._builder_resolve_generic_names()
         # Restore filter checkboxes if saved
         f = p.get("filters", {})
         if hasattr(self, 'b_f_msg'):

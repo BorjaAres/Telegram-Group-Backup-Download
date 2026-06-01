@@ -1,5 +1,7 @@
 # Telegram Group Backup & Download v1.0
 
+Created by Poleroso.
+
 A Windows desktop tool for copying and downloading Telegram groups and forum topics.
 
 ## What it does

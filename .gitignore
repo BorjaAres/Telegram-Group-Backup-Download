@@ -9,7 +9,7 @@ state_*.json
 build/
 dist/
 *.spec
-!TelegramBackup.spec
+!TelegramGroupBackupDownload.spec
 
 # Python cache
 __pycache__/

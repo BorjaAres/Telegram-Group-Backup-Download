@@ -1,0 +1,24 @@
+# Private Telegram/session data
+*.session
+*.session-journal
+tg_backup_config.json
+state_*.json
+.tg_download_state_*.json
+
+# Build outputs
+build/
+dist/
+*.spec
+!TelegramBackup.spec
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local/editor files
+.env
+.venv/
+venv/
+.idea/
+.vscode/
+*.log

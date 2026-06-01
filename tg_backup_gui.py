@@ -766,6 +766,7 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
 
         created_topics = state.setdefault("__created_topics", {})
         dest_files = state.setdefault("__dest_files", {})
+        dest_scan = state.setdefault("__dest_scan", {})
 
         def save_state():
             with open(state_file, "w", encoding="utf-8") as f:
@@ -829,13 +830,21 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
         async def scan_dest_topic_files(client, group_id, topic_id, topic_title):
             group_files = dest_files.setdefault(str(group_id), {})
             topic_files = group_files.setdefault(str(topic_id), {})
+            group_scan = dest_scan.setdefault(str(group_id), {})
+            scan_info = group_scan.setdefault(str(topic_id), {"last_msg_id": 0})
+            last_scanned = int(scan_info.get("last_msg_id", 0) or 0)
             before = len(topic_files)
             scanned = 0
-            log_q.put(f"Scanning destination topic: {topic_title}")
-            msg_iter = client.iter_messages(group_id, reverse=True, reply_to=topic_id)
+            highest_seen = last_scanned
+            if last_scanned:
+                log_q.put(f"Scanning destination topic: {topic_title} — only new messages after {last_scanned}")
+            else:
+                log_q.put(f"Scanning destination topic: {topic_title} — first scan")
+            msg_iter = client.iter_messages(group_id, reverse=True, min_id=last_scanned, reply_to=topic_id)
             async for msg in msg_iter:
                 if stop_event.is_set():
                     break
+                highest_seen = max(highest_seen, int(getattr(msg, "id", 0) or 0))
                 media = getattr(msg, "media", None)
                 fn = _get_fn(media) if media else None
                 sz = _get_sz(media) if media else None
@@ -845,8 +854,10 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                     if scanned % 500 == 0:
                         log_q.put(f"  scanned {scanned} file(s) in {topic_title}...")
             added = len(topic_files) - before
+            scan_info["last_msg_id"] = max(int(scan_info.get("last_msg_id", 0) or 0), highest_seen)
+            scan_info["file_count"] = len(topic_files)
             save_state()
-            log_q.put(f"Scanned destination topic: {topic_title} — {len(topic_files)} existing file(s), {added} new to index")
+            log_q.put(f"Scanned destination topic: {topic_title} — {scanned} new message(s) checked, {len(topic_files)} existing file(s), {added} new to index")
             return group_files
 
         async def ensure_dest_topic(client, route):

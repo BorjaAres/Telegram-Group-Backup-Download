@@ -1315,6 +1315,8 @@ class App(tk.Tk):
         self.setup_log.tag_config("ok",foreground=SUCCESS); self.setup_log.tag_config("err",foreground=DANGER)
 
     def _connect(self):
+        if self._telegram_busy("connect or log in"):
+            return
         ai=self.api_id_var.get().strip(); ah=self.api_hash_var.get().strip(); ph=self.phone_var.get().strip()
         if not ai or not ah or not ph: messagebox.showerror("Missing","Fill in API ID, Hash and Phone."); return
         self.config_data.update({"api_id":ai,"api_hash":ah,"phone":ph}); save_config(self.config_data)
@@ -1334,6 +1336,8 @@ class App(tk.Tk):
         self.code_card.pack(fill=tk.X,padx=20,pady=8); self.code_entry.focus()
 
     def _confirm_code(self):
+        if self._telegram_busy("confirm the login code"):
+            return
         threading.Thread(target=lambda:do_signin(int(self.api_id_var.get()),self.api_hash_var.get(),
             self.phone_var.get(),self.code_var.get(),self.log_queue,self.result_queue),daemon=True).start()
         self.after(500,self._chk_signin)
@@ -1345,7 +1349,19 @@ class App(tk.Tk):
             else: self.conn_lbl.config(text="✗  Wrong code",fg=DANGER)
         except queue.Empty: self.after(500,self._chk_signin)
 
+    def _telegram_busy(self, action="use Telegram"):
+        if not self.backup_running:
+            return False
+        msg = f"A task is running. Wait until it finishes before you {action}."
+        messagebox.showinfo("Task running", msg)
+        self._log_s(msg)
+        if hasattr(self, "run_log"):
+            self._log_r(msg, "y")
+        return True
+
     def _load_groups(self):
+        if self._telegram_busy("refresh groups"):
+            return
         self._log_s("Loading groups...")
         threading.Thread(target=lambda:list_groups(int(self.api_id_var.get()),self.api_hash_var.get(),
             self.log_queue,self.result_queue),daemon=True).start()
@@ -1565,6 +1581,8 @@ class App(tk.Tk):
         return next((t for t in topics if t["title"] in text), None)
 
     def _builder_load_dest_topics(self):
+        if self._telegram_busy("load topics"):
+            return
         sel = self.b_dest_var.get()
         if not sel:
             messagebox.showerror("", "Select a destination group first."); return
@@ -1581,6 +1599,8 @@ class App(tk.Tk):
         self.after(500, lambda: self._builder_chk_topics("dest"))
 
     def _builder_load_source_topics(self):
+        if self._telegram_busy("load topics"):
+            return
         sel = self.b_src_var.get()
         if not sel:
             messagebox.showerror("", "Select a source group first."); return
@@ -1621,6 +1641,8 @@ class App(tk.Tk):
             self.after(500, lambda: self._builder_chk_topics(which))
 
     def _builder_add_bucket(self):
+        if self._telegram_busy("create a topic"):
+            return
         title = self.b_new_topic_var.get().strip()
         if not title: messagebox.showerror("", "Enter a topic name."); return
         if not self._b_dest_group_id:
@@ -2096,6 +2118,8 @@ class App(tk.Tk):
         if hasattr(self,'d_src_combo'): self.d_src_combo["values"]=names
 
     def _create_group(self):
+        if self._telegram_busy("create a group"):
+            return
         title=self.new_group_name.get().strip()
         if not title: messagebox.showerror("Missing","Enter a name."); return
         ai=self.api_id_var.get(); ah=self.api_hash_var.get()
@@ -2243,6 +2267,8 @@ class App(tk.Tk):
         ttk.Button(row,text="Save Project",style="P.TButton",command=self._save_manual_project).pack(side=tk.LEFT)
 
     def _load_src_topics(self):
+        if self._telegram_busy("load topics"):
+            return
         sel=self.m_src_var.get()
         if not sel: messagebox.showerror("","Select a source group."); return
         grp=next((g for g in self.groups if g["name"] in sel),None)
@@ -2253,6 +2279,8 @@ class App(tk.Tk):
         self.after(500,lambda:self._chk_topics("src"))
 
     def _load_dst_topics(self):
+        if self._telegram_busy("load topics"):
+            return
         sel=self.m_dst_var.get()
         if not sel: messagebox.showerror("","Select a destination group."); return
         grp=next((g for g in self.groups if g["name"] in sel),None)
@@ -2279,6 +2307,8 @@ class App(tk.Tk):
         except queue.Empty: self.after(500,lambda:self._chk_topics(which))
 
     def _create_dest_topic(self):
+        if self._telegram_busy("create a topic"):
+            return
         title=self.m_new_topic_var.get().strip()
         if not title: messagebox.showerror("","Enter a topic name."); return
         sel=self.m_dst_var.get()
@@ -2476,6 +2506,8 @@ class App(tk.Tk):
         self.d_status_lbl.config(text=f"Loaded download project '{p.get('name')}'.", fg=SUCCESS)
 
     def _download_load_topics(self):
+        if self._telegram_busy("load topics"):
+            return
         src = self._group_from_selection(self.d_src_var.get())
         if not src: messagebox.showerror("", "Select a source group."); return
         self.d_status_lbl.config(text="Loading topics...", fg=WARNING)
@@ -2533,6 +2565,8 @@ class App(tk.Tk):
         return f"{topic['title']}  (id:{topic['id']}){suffix}"
 
     def _download_calculate(self):
+        if self._telegram_busy("calculate download size"):
+            return
         src = self._group_from_selection(self.d_src_var.get())
         selected = self._download_selected_topics()
         if not src or not selected: messagebox.showerror("", "Select a source group and at least one topic."); return

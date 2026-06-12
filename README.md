@@ -1,8 +1,8 @@
-# Telegram Group Backup & Download v1.0
+# Telegram Group Backup & Download v1.1
 
 Created by Poleroso.
 
-A Windows desktop tool for copying and downloading Telegram groups and forum topics.
+A desktop tool for copying, organizing, downloading, and cleaning Telegram groups and forum topics.
 
 ## What it does
 
@@ -11,6 +11,10 @@ A Windows desktop tool for copying and downloading Telegram groups and forum top
 - Save projects and run them later from a queue.
 - Download files, photos, videos, or text from selected topics into folders.
 - Resume copy/download work between runs.
+- Scan destination topics for files added outside the app.
+- Repair copied messages that are missing hidden links.
+- Find duplicate files already inside destination topics.
+- Keep preview images linked to copied files instead of copying loose image spam.
 
 ## Privacy
 
@@ -53,6 +57,16 @@ The executable will be created as:
 
 ```text
 dist\TelegramGroupBackupDownload.exe
+```
+
+## Build a macOS app
+
+See the `Mac` folder for macOS build files and instructions.
+
+GitHub macOS builds produce:
+
+```text
+TelegramGroupBackupDownload-v1.1-macOS.zip
 ```
 
 ## Notes

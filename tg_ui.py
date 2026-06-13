@@ -1,4 +1,4 @@
-import tkinter as tk
+﻿import tkinter as tk
 from tkinter import ttk
 
 BG="#0f1923";BG2="#1a2635";BG3="#1f2d3d";ACCENT="#4fc3f7";SUCCESS="#69f0ae"
@@ -6,7 +6,7 @@ WARNING="#ffd740";DANGER="#ff5252";TEXT="#e8eaf0";MUTED="#546e7a"
 FONT=("Segoe UI",10,"bold");FONT_SM=("Segoe UI",9,"bold");FONT_B=("Segoe UI",10,"bold")
 FONT_H=("Segoe UI",11,"bold");FONT_TREE=("Segoe UI",10,"bold");MONO=("Consolas",9)
 APP_NAME = "Telegram Group Backup & Download"
-APP_VERSION = "v1.1"
+APP_VERSION = "v2.1"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 def make_scrollable(parent):
     canvas = tk.Canvas(parent, bg=BG, highlightthickness=0, bd=0)
@@ -47,3 +47,4 @@ def check_row(parent, label, var):
     row = tk.Frame(parent, bg=BG2); row.pack(anchor="w", pady=2)
     tk.Checkbutton(row, text=label, variable=var, bg=BG2, fg=TEXT, activebackground=BG2,
                    activeforeground=TEXT, selectcolor=BG3, font=FONT).pack(side=tk.LEFT)
+

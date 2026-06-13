@@ -10,6 +10,10 @@ from tg_shared import (
     PREVIEW_IMAGE_LIMIT,
     PREVIEW_IMAGE_WINDOW_SECONDS,
     download_media_size as _download_media_size,
+    dest_index_has as _dest_index_has,
+    dest_index_import_sent_files as _dest_index_import_sent_files,
+    dest_index_replace_topic as _dest_index_replace_topic,
+    dest_index_track as _dest_index_track,
     fetch_all_topics as _fetch_all_topics,
     fmt_bytes as _fmt_bytes,
     get_fn as _get_fn,
@@ -27,9 +31,11 @@ from tg_shared import (
     message_text_with_links as _message_text_with_links,
     new_loop as _new_loop,
     photo_size as _photo_size,
+    load_dest_index as _load_dest_index,
     safe_name as _safe_name,
     safe_req as _safe_req,
     save_json_file as _save_json_file,
+    save_dest_index as _save_dest_index,
     send_error_label as _send_error_label,
     track as _track,
 )
@@ -38,6 +44,11 @@ from tg_shared import (
 def _photo_upload_too_large_error(err):
     text = str(err).lower()
     return "photo you tried to send cannot be saved" in text or "exceeds 10mb" in text
+
+
+def _image_processing_error(err):
+    text = str(err).lower()
+    return "failure while processing image" in text or "image_process_failed" in text
 
 
 # -- Mode A: Auto backup --------------------------------------------------------
@@ -171,7 +182,7 @@ def run_backup_auto(api_id, api_hash, source_id, dest_id, state_file, log_q, sto
                     return False
                 return abs((message.date - after_file_anchor_date).total_seconds()) <= PREVIEW_IMAGE_WINDOW_SECONDS
             async def send_preview_image(record, dest_thread):
-                nonlocal copied, errors
+                nonlocal copied, skipped, errors
                 try:
                     if filters.get("convert_image_files", False) and _is_image_document(record["media"]) and record.get("message"):
                         data = await client.download_media(record["message"], file=bytes)
@@ -188,20 +199,20 @@ def run_backup_auto(api_id, api_hash, source_id, dest_id, state_file, log_q, sto
                             if not _photo_upload_too_large_error(photo_err):
                                 raise
                             log_q.put(f"WARN [{record.get('topic_title','preview')}] image too large as photo; sending as file instead")
-                            await safe(lambda r=record: client.send_file(
-                                dest_id, r["media"], caption=r["text"], reply_to=dest_thread if dest_thread else 1,
-                                force_document=True))
+                            await client.send_file(
+                                dest_id, record["media"], caption=record["text"], reply_to=dest_thread if dest_thread else 1,
+                                force_document=True)
                     else:
-                        await safe(lambda r=record: client.send_file(
-                            dest_id, r["media"], caption=r["text"], reply_to=dest_thread if dest_thread else 1,
-                            force_document=False))
+                        await client.send_file(
+                            dest_id, record["media"], caption=record["text"], reply_to=dest_thread if dest_thread else 1,
+                            force_document=False)
                     copied += 1
                     return True
                 except InterruptedError:
                     raise
                 except Exception as img_err:
-                    errors += 1
-                    log_q.put(f"ERROR [{record.get('topic_title','preview')}] preview msg {record['id']}: {img_err}")
+                    skipped += 1
+                    log_q.put(f"WARN [{record.get('topic_title','preview')}] skipped preview msg {record['id']}: {img_err}")
                     return False
             def skip_buffered_previews(src_thread):
                 nonlocal skipped, before_file_images
@@ -413,7 +424,7 @@ def run_backup_manual(api_id, api_hash, mappings, state_file, log_q, stop_event,
                         return False
                     return abs((message.date - after_file_anchor_date).total_seconds()) <= PREVIEW_IMAGE_WINDOW_SECONDS
                 async def send_preview_image(record):
-                    nonlocal copied, errors
+                    nonlocal copied, skipped, errors
                     try:
                         if filters.get("convert_image_files", False) and _is_image_document(record["media"]) and record.get("message"):
                             data = await client.download_media(record["message"], file=bytes)
@@ -430,20 +441,20 @@ def run_backup_manual(api_id, api_hash, mappings, state_file, log_q, stop_event,
                                 if not _photo_upload_too_large_error(photo_err):
                                     raise
                                 log_q.put("   WARN image too large as photo; sending as file instead")
-                                await safe(lambda r=record: client.send_file(
-                                    dest_group_id, r["media"], caption=r["text"], reply_to=dest_topic_id,
-                                    force_document=True))
+                                await client.send_file(
+                                    dest_group_id, record["media"], caption=record["text"], reply_to=dest_topic_id,
+                                    force_document=True)
                         else:
-                            await safe(lambda r=record: client.send_file(
-                                dest_group_id, r["media"], caption=r["text"], reply_to=dest_topic_id,
-                                force_document=False))
+                            await client.send_file(
+                                dest_group_id, record["media"], caption=record["text"], reply_to=dest_topic_id,
+                                force_document=False)
                         copied += 1
                         return True
                     except InterruptedError:
                         raise
                     except Exception as img_err:
-                        errors += 1
-                        log_q.put(f"   ERROR preview msg {record['id']}: {img_err}")
+                        skipped += 1
+                        log_q.put(f"   WARN skipped preview msg {record['id']}: {img_err}")
                         return False
                 def skip_buffered_previews():
                     nonlocal skipped, before_file_images
@@ -555,8 +566,22 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
         created_topics = state.setdefault("__created_topics", {})
         dest_files = state.setdefault("__dest_files", {})
         dest_scan = state.setdefault("__dest_scan", {})
+        dest_index_cache = {}
         def save_state():
             _save_json_file(state_file, state)
+        def dest_index_for(group_id):
+            group_key = str(group_id)
+            if group_key not in dest_index_cache:
+                index = _load_dest_index(group_id)
+                legacy = dest_files.get(group_key, {})
+                if _dest_index_import_sent_files(index, legacy):
+                    _save_dest_index(index)
+                dest_index_cache[group_key] = index
+            return dest_index_cache[group_key]
+        def save_dest_index_for(group_id):
+            index = dest_index_cache.get(str(group_id))
+            if index:
+                _save_dest_index(index)
         async def safe(fn): return await _safe_req(fn, stop_event, log_q)
         source_forum_cache = {}
         async def source_has_topics(client, group_id):
@@ -600,6 +625,21 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
             except Exception:
                 topic_name_cache[group_id] = {1: "General"}
                 return topic_name_cache[group_id]
+        async def verify_topic_id(client, group_id, topic_id, expected_title=""):
+            if int(topic_id) == 1:
+                return True
+            try:
+                msg = await client.get_messages(group_id, ids=int(topic_id))
+            except Exception:
+                return False
+            if not msg:
+                return False
+            action = getattr(msg, "action", None)
+            real_title = getattr(action, "title", None)
+            if real_title:
+                names = topic_name_cache.setdefault(group_id, {})
+                names[int(topic_id)] = real_title
+            return True
         def is_generic_topic_title(title, topic_id):
             title = (title or "").strip()
             return not title or title == f"Topic {topic_id}"
@@ -671,18 +711,16 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
             return count
         async def scan_dest_topic_files(client, group_id, topic_id, topic_title):
             group_files = dest_files.setdefault(str(group_id), {})
-            topic_files = group_files.setdefault(str(topic_id), {})
+            dest_index = dest_index_for(group_id)
             group_scan = dest_scan.setdefault(str(group_id), {})
             scan_info = group_scan.setdefault(str(topic_id), {"last_msg_id": 0})
-            last_scanned = int(scan_info.get("last_msg_id", 0) or 0)
-            before = len(topic_files)
+            previous_count = int(scan_info.get("file_count", 0) or 0)
+            topic_files = {}
+            indexed_files = {}
             scanned = 0
-            highest_seen = last_scanned
-            if last_scanned:
-                log_q.put(f"Scanning destination topic: {topic_title} — only new messages after {last_scanned}")
-            else:
-                log_q.put(f"Scanning destination topic: {topic_title} — first scan")
-            msg_iter = client.iter_messages(group_id, reverse=True, min_id=last_scanned, reply_to=topic_id)
+            highest_seen = 0
+            log_q.put(f"Scanning destination topic: {topic_title} - rebuilding this topic's live file index from Telegram")
+            msg_iter = client.iter_messages(group_id, reverse=True, reply_to=topic_id)
             async for msg in msg_iter:
                 if stop_event.is_set():
                     break
@@ -692,19 +730,30 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                 sz = _get_sz(media) if media else None
                 if fn and sz:
                     topic_files[fn] = sz
+                    row = indexed_files.setdefault(fn, {"size": int(sz), "sizes": [], "msg_id": None})
+                    row["size"] = int(sz)
+                    if int(sz) not in row["sizes"]:
+                        row["sizes"].append(int(sz))
+                    row["msg_id"] = getattr(msg, "id", None)
                     scanned += 1
                     if scanned % 500 == 0:
                         log_q.put(f"  scanned {scanned} file(s) in {topic_title}...")
-            added = len(topic_files) - before
-            scan_info["last_msg_id"] = max(int(scan_info.get("last_msg_id", 0) or 0), highest_seen)
+            group_files[str(topic_id)] = topic_files
+            _dest_index_replace_topic(dest_index, topic_id, indexed_files)
+            scan_info["last_msg_id"] = highest_seen
             scan_info["file_count"] = len(topic_files)
             save_state()
-            log_q.put(f"Scanned destination topic: {topic_title} — {scanned} new message(s) checked, {len(topic_files)} existing file(s), {added} new to index")
+            save_dest_index_for(group_id)
+            delta = len(topic_files) - previous_count
+            log_q.put(f"Scanned destination topic: {topic_title} - {len(topic_files)} live file(s), index adjusted by {delta}")
             return group_files
         async def live_dest_topic_files(client, group_id, topic_id, topic_title):
             live_files = {}
+            live_file_keys = set()
+            indexed_files = {}
+            dest_index = dest_index_for(group_id)
             scanned = 0
-            log_q.put(f"Repair files: scanning live destination topic {topic_title}")
+            log_q.put(f"Repair files: rebuilding live destination index for {topic_title}")
             async for msg in client.iter_messages(group_id, reverse=True, reply_to=topic_id):
                 if stop_event.is_set():
                     break
@@ -712,12 +761,22 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                 fn = _get_fn(media) if media else None
                 sz = _get_sz(media) if media else None
                 if fn and sz:
+                    live_file_keys.add((str(fn).strip().casefold(), int(sz or 0)))
                     live_files[fn] = sz
+                    row = indexed_files.setdefault(fn, {"size": int(sz), "sizes": [], "msg_id": None})
+                    row["size"] = int(sz)
+                    if int(sz) not in row["sizes"]:
+                        row["sizes"].append(int(sz))
+                    row["msg_id"] = getattr(msg, "id", None)
                     scanned += 1
                     if scanned % 500 == 0:
                         log_q.put(f"  scanned {scanned} destination file(s) in {topic_title}...")
-            log_q.put(f"Repair files: destination has {len(live_files)} file(s) in {topic_title}")
-            return live_files
+            _dest_index_replace_topic(dest_index, topic_id, indexed_files)
+            dest_files.setdefault(str(group_id), {})[str(topic_id)] = live_files
+            save_state()
+            save_dest_index_for(group_id)
+            log_q.put(f"Repair files: destination has {len(live_files)} live file(s) in {topic_title}")
+            return live_files, live_file_keys
         async def collect_link_repairs(client, route, src_forum, src_topic_id, last_id):
             if not last_id:
                 return []
@@ -815,14 +874,36 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                     log_q.put(f"Repair links: old copy not found for {label}")
             log_q.put(f"Repair links done: {fixed} fixed, {skipped} skipped, {errors} errors in {route_label}")
             return fixed, skipped, errors
-        async def repair_route_missing_files(client, route, dest_topic_id, src_forum, src_topic_id):
+        async def repair_route_missing_files(client, route, dest_topic_id, src_forum, src_topic_id, ms):
             from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage
             route_label = f"{route.get('src_group_name','Unknown')} / {route.get('src_topic_title','General')} -> {route.get('dest_group_name','Unknown')} / {route.get('dest_topic_title','Unknown')}"
-            existing_files = await live_dest_topic_files(
+            dest_index = dest_index_for(route["dest_group_id"])
+            existing_files, existing_file_keys = await live_dest_topic_files(
                 client, route["dest_group_id"], dest_topic_id,
                 route.get("dest_topic_title") or f"Topic {dest_topic_id}"
             )
             copied = skipped = errors = scanned = missing = 0
+            sent_files = ms.setdefault("sent_files", {})
+            repair_done = state.setdefault("__repair_missing_files", {})
+            repair_route_key = f"{route['src_group_id']}_{src_topic_id}_{route['dest_group_id']}_{dest_topic_id}"
+            repaired_sources = repair_done.setdefault(repair_route_key, {})
+            repair_done_by_source = state.setdefault("__repair_missing_files_by_source", {})
+            def repair_source_key(msg, fn, sz):
+                return f"{getattr(msg, 'id', 0)}|{fn}|{int(sz or 0)}"
+            def repair_global_source_key(msg, fn, sz):
+                return f"{route['src_group_id']}_{src_topic_id}_{getattr(msg, 'id', 0)}|{fn}|{int(sz or 0)}"
+            def file_already_exists(fn, sz):
+                return (str(fn).strip().casefold(), int(sz or 0)) in existing_file_keys
+            def remember_existing_file(fn, sz):
+                existing_files[fn] = sz
+                existing_file_keys.add((str(fn).strip().casefold(), int(sz or 0)))
+            def mark_repaired(msg, fn, sz):
+                repaired_sources[repair_source_key(msg, fn, sz)] = True
+                repair_done_by_source[repair_global_source_key(msg, fn, sz)] = {
+                    "dest_group_id": route["dest_group_id"],
+                    "dest_topic_id": dest_topic_id,
+                    "dest_topic_title": route.get("dest_topic_title", ""),
+                }
             before_file_images = []
             def reply_to_msg_id(message):
                 reply = getattr(message, "reply_to", None)
@@ -834,7 +915,7 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                     return False
                 return abs((file_date - image_date).total_seconds()) <= PREVIEW_IMAGE_WINDOW_SECONDS
             async def send_preview_image(record):
-                nonlocal copied, errors
+                nonlocal copied, skipped, errors
                 try:
                     if filters.get("convert_image_files", False) and _is_image_document(record["media"]) and record.get("message"):
                         data = await client.download_media(record["message"], file=bytes)
@@ -851,20 +932,20 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                             if not _photo_upload_too_large_error(photo_err):
                                 raise
                             log_q.put(f"WARN repair files [{route_label}] image too large as photo; sending as file instead")
-                            await safe(lambda r=record: client.send_file(
-                                route["dest_group_id"], r["media"], caption=r["text"], reply_to=dest_topic_id,
-                                force_document=True))
+                            await client.send_file(
+                                route["dest_group_id"], record["media"], caption=record["text"], reply_to=dest_topic_id,
+                                force_document=True)
                     else:
-                        await safe(lambda r=record: client.send_file(
-                            route["dest_group_id"], r["media"], caption=r["text"], reply_to=dest_topic_id,
-                            force_document=False))
+                        await client.send_file(
+                            route["dest_group_id"], record["media"], caption=record["text"], reply_to=dest_topic_id,
+                            force_document=False)
                     copied += 1
                     return True
                 except InterruptedError:
                     raise
                 except Exception as img_err:
-                    errors += 1
-                    log_q.put(f"ERROR repair files preview [{route_label}] msg {record['id']}: {img_err}")
+                    skipped += 1
+                    log_q.put(f"WARN repair files preview [{route_label}] skipped msg {record['id']}: {img_err}")
                     return False
             def skip_buffered_previews():
                 nonlocal skipped, before_file_images
@@ -909,14 +990,28 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                         skipped += 1
                         skip_buffered_previews()
                         continue
-                    if existing_files.get(fn) == sz:
+                    src_repair_key = repair_source_key(msg, fn, sz)
+                    global_repair_key = repair_global_source_key(msg, fn, sz)
+                    if repaired_sources.get(src_repair_key) or repair_done_by_source.get(global_repair_key):
+                        skipped += 1
+                        skip_buffered_previews()
+                        continue
+                    if file_already_exists(fn, sz):
+                        mark_repaired(msg, fn, sz)
+                        save_state()
                         skipped += 1
                         skip_buffered_previews()
                         continue
                     missing += 1
                     kwargs = {"reply_to": dest_topic_id}
                     await safe(lambda: client.send_file(route["dest_group_id"], media, caption=text, **kwargs))
-                    existing_files[fn] = sz
+                    remember_existing_file(fn, sz)
+                    _track(sent_files, dest_topic_id, fn, sz)
+                    ms["sent_files"] = sent_files
+                    _dest_index_track(dest_index, dest_topic_id, fn, sz)
+                    mark_repaired(msg, fn, sz)
+                    save_state()
+                    save_dest_index_for(route["dest_group_id"])
                     copied += 1
                     file_reply_id = reply_to_msg_id(msg)
                     selected_previews = [
@@ -942,11 +1037,33 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
             return missing, copied, skipped, errors
         async def ensure_dest_topic(client, route):
             dest_id = route.get("dest_topic_id")
-            if dest_id:
-                return dest_id
             title = route.get("dest_topic_title", "").strip()
+            dst_entity = None
+            if dest_id:
+                if int(dest_id) == 1:
+                    return 1
+                names = await topic_names(client, route["dest_group_id"])
+                if int(dest_id) in names:
+                    return int(dest_id)
+                if await verify_topic_id(client, route["dest_group_id"], int(dest_id), title):
+                    return int(dest_id)
+                if title:
+                    matches = [tid for tid, name in names.items() if name.strip().lower() == title.lower()]
+                    if len(matches) == 1:
+                        new_id = int(matches[0])
+                        old_id = dest_id
+                        route["dest_topic_id"] = new_id
+                        save_state()
+                        log_q.put(f"WARN destination topic id changed for {title}: {old_id} -> {new_id}")
+                        return new_id
+                    if len(matches) > 1:
+                        raise RuntimeError(f"Destination topic id {dest_id} no longer exists and multiple live topics are named '{title}'. Fix this route manually.")
+                raise RuntimeError(f"Destination topic id {dest_id} no longer exists for '{title or route.get('src_topic_title','Unknown')}'. Route skipped to avoid sending to General.")
             if not title:
                 raise RuntimeError(f"Route has no destination topic: {route.get('src_group_name','Unknown')} / {route.get('src_topic_title','Unknown')}")
+            dst_entity = await client.get_entity(route["dest_group_id"])
+            if not getattr(dst_entity, "forum", False):
+                raise RuntimeError(f"Destination group '{route.get('dest_group_name','Unknown')}' does not have topics enabled, so '{title}' cannot be created safely.")
             group_key = str(route["dest_group_id"])
             created_topics.setdefault(group_key, {})
             if title in created_topics[group_key]:
@@ -978,7 +1095,15 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                         f"{route.get('dest_group_name','Unknown')} / {route.get('dest_topic_title','Unknown')}"
                     )
                     log_q.put(f"Preparing route {route_index}/{route_count}: {label}")
-                dest_topic_id = await ensure_dest_topic(client, route)
+                try:
+                    dest_topic_id = await ensure_dest_topic(client, route)
+                except Exception as e:
+                    log_q.put(
+                        f"ERROR skipped route: {route.get('src_group_name','Unknown')} / "
+                        f"{route.get('src_topic_title','Unknown')} -> {route.get('dest_group_name','Unknown')} / "
+                        f"{route.get('dest_topic_title','Unknown')}: {e}"
+                    )
+                    continue
                 src_topic_id = route.get("src_topic_id", 1)
                 src_forum = route.get("source_has_topics")
                 if src_forum is None:
@@ -1022,18 +1147,32 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                 log_q.put(f"\nRepair complete. {fixed_total} fixed, {skipped_total} skipped, {errors_total} errors.")
                 return
             if repair_missing_files:
-                log_q.put("Repair Missing Files mode: scanning old source history and live destination topics. Normal project progress will not be changed.\n")
+                log_q.put("Repair Missing Files mode: repairing missing links first, then scanning old source history and live destination topics. Normal project progress will not be changed.\n")
                 missing_total = copied_total = skipped_total = errors_total = 0
+                link_fixed_total = link_skipped_total = link_errors_total = 0
                 for route, dest_topic_id, src_forum, key, ms, route_total in prepared:
                     if stop_event.is_set():
                         log_q.put("Stopped between routes.")
                         break
+                    f, ls, le = await repair_route_links(
+                        client, route, dest_topic_id, src_forum,
+                        route.get("src_topic_id", 1), ms
+                    )
+                    link_fixed_total += f; link_skipped_total += ls; link_errors_total += le
+                    if stop_event.is_set():
+                        log_q.put("Stopped between link repair and file repair.")
+                        break
                     m, c, s, e = await repair_route_missing_files(
                         client, route, dest_topic_id, src_forum,
-                        route.get("src_topic_id", 1)
+                        route.get("src_topic_id", 1), ms
                     )
                     missing_total += m; copied_total += c; skipped_total += s; errors_total += e
-                log_q.put(f"\nRepair files complete. {missing_total} missing file(s), {copied_total} copied items, {skipped_total} skipped, {errors_total} errors.")
+                log_q.put(
+                    f"\nSUMMARY Repair files complete. Links: {link_fixed_total} fixed, "
+                    f"{link_skipped_total} skipped, {link_errors_total} errors. "
+                    f"Files: {missing_total} missing file(s), {copied_total} copied items, "
+                    f"{skipped_total} skipped, {errors_total} errors."
+                )
                 return
             log_q.put(f"Total messages to copy across all routes: {total_remaining}\n")
             copied = skipped = errors = processed_total = 0
@@ -1045,6 +1184,9 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                 last_id = ms.get("last_msg_id", 0)
                 sent_files = ms.setdefault("sent_files", {})
                 destination_sent_files = dest_files.setdefault(str(route["dest_group_id"]), {})
+                dest_index = dest_index_for(route["dest_group_id"])
+                if _dest_index_import_sent_files(dest_index, destination_sent_files):
+                    save_dest_index_for(route["dest_group_id"])
                 route_label = f"{route.get('src_group_name','Unknown')} / {route.get('src_topic_title','General')} -> {route.get('dest_group_name','Unknown')} / {route.get('dest_topic_title','Unknown')}"
                 progress_label = route_label.replace(" -> ", " -> ")
                 log_q.put(f"\nRoute: {route_label}")
@@ -1072,7 +1214,7 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                         return False
                     return abs((message.date - after_file_anchor_date).total_seconds()) <= PREVIEW_IMAGE_WINDOW_SECONDS
                 async def send_preview_image(record):
-                    nonlocal copied, route_copied, errors, route_errors
+                    nonlocal copied, route_copied, skipped, route_skipped, errors, route_errors
                     try:
                         if filters.get("convert_image_files", False) and _is_image_document(record["media"]) and record.get("message"):
                             data = await client.download_media(record["message"], file=bytes)
@@ -1089,20 +1231,20 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                                 if not _photo_upload_too_large_error(photo_err):
                                     raise
                                 log_q.put(f"WARN [{route_label}] image too large as photo; sending as file instead")
-                                await safe(lambda r=record: client.send_file(
-                                    route["dest_group_id"], r["media"], caption=r["text"], reply_to=dest_topic_id,
-                                    force_document=True))
+                                await client.send_file(
+                                    route["dest_group_id"], record["media"], caption=record["text"], reply_to=dest_topic_id,
+                                    force_document=True)
                         else:
-                            await safe(lambda r=record: client.send_file(
-                                route["dest_group_id"], r["media"], caption=r["text"], reply_to=dest_topic_id,
-                                force_document=False))
+                            await client.send_file(
+                                route["dest_group_id"], record["media"], caption=record["text"], reply_to=dest_topic_id,
+                                force_document=False)
                         copied += 1; route_copied += 1
                         return True
                     except InterruptedError:
                         raise
                     except Exception as img_err:
-                        errors += 1; route_errors += 1
-                        log_q.put(f"ERROR [{route_label}] preview msg {record['id']}: {img_err}")
+                        skipped += 1; route_skipped += 1
+                        log_q.put(f"WARN [{route_label}] skipped preview msg {record['id']}: {img_err}")
                         return False
                 def skip_buffered_previews():
                     nonlocal skipped, route_skipped, before_file_images
@@ -1149,7 +1291,8 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                                 fn = _get_fn(media); sz = _get_sz(media)
                                 dup_in_route = _is_dup(sent_files, dest_topic_id, fn, sz)
                                 dup_in_dest = _is_dup(destination_sent_files, dest_topic_id, fn, sz)
-                                if filters.get("skip_duplicates", True) and (dup_in_route or dup_in_dest):
+                                dup_in_index = _dest_index_has(dest_index, dest_topic_id, fn, sz)
+                                if filters.get("skip_duplicates", True) and (dup_in_route or dup_in_dest or dup_in_index):
                                     skipped += 1; route_skipped += 1
                                     skip_buffered_previews()
                                     after_file_image_slots = 0
@@ -1158,6 +1301,8 @@ def run_backup_routes(api_id, api_hash, routes, state_file, log_q, stop_event, f
                                     await safe(lambda: client.send_file(route["dest_group_id"], media, caption=text, **kwargs))
                                     _track(sent_files, dest_topic_id, fn, sz)
                                     _track(destination_sent_files, dest_topic_id, fn, sz)
+                                    _dest_index_track(dest_index, dest_topic_id, fn, sz)
+                                    save_dest_index_for(route["dest_group_id"])
                                     copied += 1; route_copied += 1
                                     file_reply_id = reply_to_msg_id(msg)
                                     selected_previews = [

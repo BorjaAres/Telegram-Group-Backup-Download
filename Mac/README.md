@@ -1,4 +1,4 @@
-# Telegram Group Backup & Download v1.1 for macOS
+﻿# Telegram Group Backup & Download v2.1 for macOS
 
 This folder is self-contained. It includes the app code and the Mac build script.
 
@@ -10,7 +10,7 @@ Included files:
 - `tg_workers.py`
 - `tg_ui.py`
 - `requirements.txt`
-- `Telegram Group Backup & Download v1.1 Guide.pdf`
+- `Telegram Group Backup & Download v2.1 Guide.pdf`
 - `build_mac.sh`
 
 ## Easiest option
@@ -31,19 +31,19 @@ chmod +x build_mac.sh
 The app will be created as:
 
 ```text
-dist/TelegramGroupBackupDownload.app
+dist/TelegramGroupBackupDownload-v2.1.app
 ```
 
 The app title inside the window should show:
 
 ```text
-Telegram Group Backup & Download v1.1
+Telegram Group Backup & Download v2.1
 ```
 
 To run it, open:
 
 ```text
-dist/TelegramGroupBackupDownload.app
+dist/TelegramGroupBackupDownload-v2.1.app
 ```
 
 ## Build from GitHub
@@ -57,7 +57,7 @@ The GitHub workflow at:
 uses this folder's build script and creates:
 
 ```text
-TelegramGroupBackupDownload-v1.1-macOS.zip
+TelegramGroupBackupDownload-v2.1-macOS.zip
 ```
 
 ## Note
@@ -67,3 +67,5 @@ The app is not Apple-signed or notarized. On first launch, Mac users may need to
 If macOS says the app is from an unidentified developer, right-click the app, choose Open, then confirm Open again.
 
 Do not include Telegram session files, config files, state files, or downloaded media when sharing this folder.
+
+

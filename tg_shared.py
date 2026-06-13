@@ -1,8 +1,13 @@
 import asyncio
+import glob
 import json
 import os
 import re
+import shutil
 import sys
+
+
+MIGRATION_NOTICE_FILE = ".migration_notice.txt"
 
 
 def _is_writable_dir(folder):
@@ -17,40 +22,77 @@ def _is_writable_dir(folder):
         return False
 
 
-def _copy_config_if_needed(src_folder, dest_folder):
-    src = os.path.join(src_folder, "tg_backup_config.json")
-    dest = os.path.join(dest_folder, "tg_backup_config.json")
-    if not os.path.exists(src) or os.path.exists(dest):
-        return
+def _copy_if_missing(src, dest_folder):
+    if not os.path.exists(src):
+        return False
+    dest = os.path.join(dest_folder, os.path.basename(src))
+    if os.path.exists(dest):
+        return False
     try:
-        with open(src, encoding="utf-8") as f:
-            data = f.read()
-        with open(dest, "w", encoding="utf-8") as f:
-            f.write(data)
+        shutil.copy2(src, dest)
+        return True
     except Exception:
-        pass
+        return False
+
+
+def _migrate_app_data(src_folders, dest_folder):
+    copied = []
+    patterns = [
+        "tg_backup_config.json",
+        "state_*.json",
+        "session_gui*",
+        ".tg_download_state_*.json",
+    ]
+    for folder in src_folders:
+        if not folder or not os.path.isdir(folder) or os.path.abspath(folder) == os.path.abspath(dest_folder):
+            continue
+        for pattern in patterns:
+            for src in glob.glob(os.path.join(folder, pattern)):
+                if _copy_if_missing(src, dest_folder):
+                    copied.append(os.path.basename(src))
+    if copied:
+        try:
+            with open(os.path.join(dest_folder, MIGRATION_NOTICE_FILE), "w", encoding="utf-8") as f:
+                f.write(
+                    "Your existing Telegram login/projects were copied into App Files\\App data.\n"
+                    "Old files were left in place.\n\n"
+                    + "\n".join(sorted(copied))
+                )
+        except Exception:
+            pass
+    return copied
 
 
 def _use_existing_app_data():
     if not getattr(sys, "frozen", False):
         return
     exe_dir = os.path.dirname(sys.executable)
+    default_folder = os.path.join(exe_dir, "App Files", "App data")
+    old_candidates = [
+        exe_dir,
+        os.path.join(exe_dir, "dist"),
+        os.path.join(exe_dir, "App Files", "Source code"),
+        os.path.dirname(exe_dir),
+    ]
+    if _is_writable_dir(default_folder):
+        _migrate_app_data(old_candidates, default_folder)
+        if os.path.exists(os.path.join(default_folder, "tg_backup_config.json")):
+            os.chdir(default_folder)
+            return
     candidates = [
-        os.path.join(exe_dir, "App Files", "App data"),
+        default_folder,
         exe_dir,
     ]
     for folder in candidates:
         if os.path.exists(os.path.join(folder, "tg_backup_config.json")) and _is_writable_dir(folder):
             os.chdir(folder)
             return
-    default_folder = os.path.join(exe_dir, "App Files", "App data")
     if _is_writable_dir(default_folder):
         os.chdir(default_folder)
         return
     fallback = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Telegram Group Backup Download")
     if _is_writable_dir(fallback):
-        for folder in candidates:
-            _copy_config_if_needed(folder, fallback)
+        _migrate_app_data(old_candidates + candidates, fallback)
         os.chdir(fallback)
         return
 
@@ -60,16 +102,24 @@ _use_existing_app_data()
 CONFIG_FILE = "tg_backup_config.json"
 PREVIEW_IMAGE_LIMIT = 3
 PREVIEW_IMAGE_WINDOW_SECONDS = 120
+DEST_INDEX_VERSION = 1
 
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return {"api_id": "", "api_hash": "", "phone": "", "projects": []}
+            cfg = json.load(f)
+    else:
+        cfg = {"api_id": "", "api_hash": "", "phone": "", "projects": []}
+    notice = pop_migration_notice()
+    if notice:
+        cfg["_migration_notice"] = notice
+    return cfg
 
 
 def save_config(cfg):
+    cfg = dict(cfg)
+    cfg.pop("_migration_notice", None)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
@@ -85,6 +135,143 @@ def save_json_file(path, data, **dump_kwargs):
                 json.dump(data, f, **dump_kwargs)
         except Exception:
             raise
+
+
+def dest_index_file(group_id):
+    safe = re.sub(r"[^0-9A-Za-z_-]+", "_", str(group_id))
+    return f"dest_index_{safe}.json"
+
+
+def load_dest_index(group_id):
+    path = dest_index_file(group_id)
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("version", DEST_INDEX_VERSION)
+                data.setdefault("group_id", group_id)
+                data.setdefault("topics", {})
+                data.setdefault("built_topics", {})
+                return data
+        except Exception:
+            pass
+    return {"version": DEST_INDEX_VERSION, "group_id": group_id, "topics": {}, "built_topics": {}}
+
+
+def save_dest_index(index):
+    save_json_file(dest_index_file(index.get("group_id", "unknown")), index, indent=2, ensure_ascii=False)
+
+
+def dest_index_topic(index, topic_id):
+    topics = index.setdefault("topics", {})
+    return topics.setdefault(str(topic_id), {})
+
+
+def dest_index_has(index, topic_id, fn, sz):
+    if not fn or not sz:
+        return False
+    row = dest_index_topic(index, topic_id).get(fn)
+    if isinstance(row, dict):
+        sizes = row.get("sizes")
+        if isinstance(sizes, list):
+            try:
+                return int(sz) in {int(s or 0) for s in sizes}
+            except Exception:
+                pass
+        return int(row.get("size", 0) or 0) == int(sz)
+    return row == sz
+
+
+def dest_index_track(index, topic_id, fn, sz, msg_id=None):
+    if not fn or not sz:
+        return
+    topic = dest_index_topic(index, topic_id)
+    row = topic.get(fn)
+    if isinstance(row, dict):
+        count = int(row.get("count", 1) or 1)
+        row["size"] = int(sz)
+        sizes = row.setdefault("sizes", [])
+        if int(sz) not in {int(s or 0) for s in sizes}:
+            sizes.append(int(sz))
+        row["count"] = count + (0 if msg_id and msg_id in row.get("message_ids", []) else 1)
+        if msg_id:
+            ids = row.setdefault("message_ids", [])
+            if msg_id not in ids:
+                ids.append(msg_id)
+            row["last_msg_id"] = msg_id
+    else:
+        topic[fn] = {
+            "size": int(sz),
+            "sizes": [int(sz)],
+            "count": 1,
+            "message_ids": [msg_id] if msg_id else [],
+            "last_msg_id": msg_id,
+        }
+
+
+def dest_index_replace_topic(index, topic_id, files):
+    topic = {}
+    for fn, value in (files or {}).items():
+        msg_id = None
+        if isinstance(value, dict):
+            sz = value.get("size")
+            sizes = value.get("sizes")
+            msg_id = value.get("msg_id") or value.get("last_msg_id")
+        else:
+            sz = value
+            sizes = None
+        if fn and sz:
+            clean_sizes = []
+            if isinstance(sizes, list):
+                clean_sizes = sorted({int(s or 0) for s in sizes if s})
+            if int(sz) not in clean_sizes:
+                clean_sizes.append(int(sz))
+            topic[fn] = {
+                "size": int(sz),
+                "sizes": clean_sizes,
+                "count": 1,
+                "message_ids": [msg_id] if msg_id else [],
+                "last_msg_id": msg_id,
+            }
+    index.setdefault("topics", {})[str(topic_id)] = topic
+
+
+def dest_index_import_sent_files(index, sent_files):
+    changed = False
+    if not isinstance(sent_files, dict):
+        return False
+    for topic_id, rows in sent_files.items():
+        if not isinstance(rows, dict):
+            continue
+        for fn, value in rows.items():
+            sizes = []
+            if isinstance(value, dict):
+                if isinstance(value.get("sizes"), list):
+                    sizes.extend(value.get("sizes"))
+                elif value.get("size"):
+                    sizes.append(value.get("size"))
+            elif isinstance(value, list):
+                sizes.extend(value)
+            else:
+                sizes.append(value)
+            for sz in sizes:
+                if fn and sz and not dest_index_has(index, topic_id, fn, sz):
+                    dest_index_track(index, topic_id, fn, sz)
+                    changed = True
+    return changed
+
+
+def pop_migration_notice():
+    if not os.path.exists(MIGRATION_NOTICE_FILE):
+        return ""
+    try:
+        with open(MIGRATION_NOTICE_FILE, encoding="utf-8") as f:
+            msg = f.read().strip()
+        os.remove(MIGRATION_NOTICE_FILE)
+        return msg
+    except Exception:
+        return ""
 
 
 def new_loop(coro):
@@ -283,7 +470,22 @@ def get_sz(media):
 def is_dup(sent_files, tid, fn, sz):
     if not fn or not sz:
         return False
-    return sent_files.get(str(tid), {}).get(fn) == sz
+    row = sent_files.get(str(tid), {}).get(fn)
+    try:
+        wanted = int(sz)
+    except Exception:
+        return row == sz
+    if isinstance(row, dict):
+        sizes = row.get("sizes")
+        if isinstance(sizes, list):
+            return wanted in {int(s or 0) for s in sizes}
+        return int(row.get("size", 0) or 0) == wanted
+    if isinstance(row, list):
+        return wanted in {int(s or 0) for s in row}
+    try:
+        return int(row or 0) == wanted
+    except Exception:
+        return row == sz
 
 
 def track(sent_files, tid, fn, sz):
@@ -292,7 +494,31 @@ def track(sent_files, tid, fn, sz):
     key = str(tid)
     if key not in sent_files:
         sent_files[key] = {}
-    sent_files[key][fn] = sz
+    try:
+        size = int(sz)
+    except Exception:
+        sent_files[key][fn] = sz
+        return
+    row = sent_files[key].get(fn)
+    if isinstance(row, dict):
+        sizes = row.setdefault("sizes", [])
+        if size not in {int(s or 0) for s in sizes}:
+            sizes.append(size)
+        row["size"] = size
+        return
+    if isinstance(row, list):
+        if size not in {int(s or 0) for s in row}:
+            row.append(size)
+        return
+    sizes = []
+    if row:
+        try:
+            sizes.append(int(row))
+        except Exception:
+            pass
+    if size not in sizes:
+        sizes.append(size)
+    sent_files[key][fn] = {"size": size, "sizes": sizes}
 
 
 def safe_name(name, fallback="item"):

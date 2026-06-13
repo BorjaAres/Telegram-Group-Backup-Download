@@ -1,4 +1,4 @@
-# Telegram Group Backup & Download v1.1
+﻿# Telegram Group Backup & Download v2.1
 
 Created by Poleroso.
 
@@ -56,7 +56,7 @@ build.bat
 The executable will be created as:
 
 ```text
-dist\TelegramGroupBackupDownload.exe
+dist\TelegramGroupBackupDownload-v2.1.exe
 ```
 
 ## Build a macOS app
@@ -66,9 +66,11 @@ See the `Mac` folder for macOS build files and instructions.
 GitHub macOS builds produce:
 
 ```text
-TelegramGroupBackupDownload-v1.1-macOS.zip
+TelegramGroupBackupDownload-v2.1-macOS.zip
 ```
 
 ## Notes
 
 This app uses Telethon and requires access to a Telegram account you control. Use it only with groups and content you are allowed to copy or download.
+
+

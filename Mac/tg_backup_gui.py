@@ -71,10 +71,16 @@ class App(tk.Tk):
         self._m_src_topics = []; self._m_dst_topics = []
         self._manual_mappings = []
         self._b_src_topics = []; self._b_dst_topics = []; self._b_routes = []
+        self._b_src_is_forum = False; self._b_dest_is_forum = False
         self._d_topics = []; self._d_topic_view = []
         self._clean_topics = []; self._clean_dupes = []
         self._b_loaded_project_index = None
         self._styles(); self._build()
+        if self.config_data.get("_migration_notice"):
+            self.after(800, lambda: messagebox.showinfo(
+                "Projects and login found",
+                self.config_data.get("_migration_notice", "")
+            ))
         self.after(300, self._poll)
     def _styles(self):
         s = ttk.Style(self); s.theme_use("clam")
@@ -295,7 +301,7 @@ class App(tk.Tk):
         tk.Label(r4b, text="Group copy mode:", bg=BG2, fg=TEXT, font=FONT_B).pack(side=tk.LEFT, padx=(0,8))
         self.b_whole_group_var = tk.BooleanVar(value=False)
         tk.Checkbutton(r4b,
-                       text="Create/reuse matching destination topics",
+                       text="Create/reuse topics when running",
                        variable=self.b_whole_group_var,
                        command=self._builder_whole_mode_changed,
                        bg=BG2, fg=TEXT, activebackground=BG2, activeforeground=TEXT,
@@ -445,6 +451,7 @@ class App(tk.Tk):
             if isinstance(r, list):
                 if which == "dest":
                     self._b_dest_topics = r
+                    self._b_dest_is_forum = not (len(r) == 1 and int(r[0].get("id", 1)) == 1 and "no topics" in r[0].get("title", "").lower())
                     self._builder_merge_known_dest_topics()
                     self._builder_apply_topic_names("dest", r)
                     if hasattr(self, 'b_dest_status'):
@@ -453,6 +460,7 @@ class App(tk.Tk):
                     self._builder_redraw()
                 else:
                     self._b_src_topics = r
+                    self._b_src_is_forum = not (len(r) == 1 and int(r[0].get("id", 1)) == 1 and "no topics" in r[0].get("title", "").lower())
                     self._builder_apply_topic_names("src", r)
                     topic_values = [self._topic_display(t) for t in sorted(r, key=lambda t: t.get("title", "").lower())]
                     self._builder_make_searchable_combo(self.b_src_topic_combo, topic_values)
@@ -462,8 +470,6 @@ class App(tk.Tk):
                         if hasattr(self, 'b_src_status'):
                             self.b_src_status.config(text="No topics found. Add General as a single route if needed.", fg=WARNING)
                     else:
-                        self.b_whole_group_var.set(False)
-                        self.b_flatten_group_var.set(False)
                         if hasattr(self, 'b_src_status'):
                             self.b_src_status.config(
                                 text=f"{len(r)} topics loaded.", fg=SUCCESS)
@@ -629,15 +635,17 @@ class App(tk.Tk):
             self.b_whole_group_var.set(False)
         self._builder_update_add_buttons()
     def _builder_add_routes(self, add_all=False):
-        if not self._b_dest_topics:
+        clone_topics = self.b_whole_group_var.get()
+        flatten_group = self.b_flatten_group_var.get()
+        if not self._b_dest_group_id:
+            messagebox.showerror("", "Choose a destination group first."); return
+        if not self._b_dest_topics and not (clone_topics and self._b_dest_is_forum):
             messagebox.showerror("", "Load destination topics first."); return
         sel_src = self.b_src_var.get()
         if not sel_src:
             messagebox.showerror("", "Select a source group."); return
         src_grp = next((g for g in self.groups if g["name"] in sel_src), None)
         if not src_grp: return
-        clone_topics = self.b_whole_group_var.get()
-        flatten_group = self.b_flatten_group_var.get()
         added = 0
         new_routes = []
         def make_route(tid, ttitle, clone=False, flatten=False):
@@ -652,6 +660,7 @@ class App(tk.Tk):
             return {
                 "src_group_id": src_grp["id"], "src_group_name": src_grp["name"],
                 "src_topic_id": tid, "src_topic_title": ttitle,
+                "source_has_topics": self._b_src_is_forum,
                 "dest_group_id": self._b_dest_group_id,
                 "dest_topic_id": dest["id"] if dest else None,
                 "dest_topic_title": dest["title"] if dest else (ttitle if clone else None),
@@ -662,6 +671,9 @@ class App(tk.Tk):
         if clone_topics or flatten_group:
             if not self._b_src_topics:
                 messagebox.showerror("", "Load source topics first."); return
+            if clone_topics and not self._b_src_is_forum:
+                messagebox.showerror("", "This source group has no topics to clone. Use the one-topic option instead.")
+                return
             for t in self._b_src_topics:
                 r = make_route(t["id"], t["title"], clone=clone_topics, flatten=flatten_group)
                 if r: self._b_routes.append(r); new_routes.append(r); added += 1
@@ -902,6 +914,8 @@ class App(tk.Tk):
         self._b_tree_routes = {}
         self._b_tree_group_routes = {}
         def route_status(route):
+            if route.get("dest_topic_action") == "create" and route.get("dest_topic_title"):
+                return "Create", "ready", 3
             if not route.get("dest_topic_id"):
                 return "Choose destination", "needs", 0
             if route.get("accepted"):
@@ -912,7 +926,9 @@ class App(tk.Tk):
         buckets = {}
         for r in self._b_routes:
             status, tag, priority = route_status(r)
-            if not r.get("dest_topic_id"):
+            if r.get("dest_topic_action") == "create" and r.get("dest_topic_title"):
+                key = (r.get("dest_topic_title", ""), f"create:{r.get('dest_topic_title', '')}")
+            elif not r.get("dest_topic_id"):
                 key = ("Needs destination", None)
             elif tag == "suggestion":
                 key = ("Suggestions to approve", "__suggestions__")
@@ -945,7 +961,9 @@ class App(tk.Tk):
                 self._b_tree_group_routes[parent] = list(routes)
                 for r in sorted(routes, key=lambda x: (x["src_group_name"].lower(), x["src_topic_title"].lower())):
                     status, row_tag, _priority = route_status(r)
-                    if not r.get("dest_topic_id"):
+                    if r.get("dest_topic_action") == "create" and r.get("dest_topic_title"):
+                        dest = r.get("dest_topic_title", "")
+                    elif not r.get("dest_topic_id"):
                         dest = ""
                     else:
                         dest = r.get("dest_topic_title", "")
@@ -957,7 +975,11 @@ class App(tk.Tk):
         # Update status label
         total = len(self._b_routes)
         accepted = sum(1 for r in self._b_routes if r.get("accepted"))
-        n_unassigned = sum(1 for r in self._b_routes if not r.get("dest_topic_id"))
+        n_unassigned = sum(
+            1 for r in self._b_routes
+            if not r.get("dest_topic_id")
+            and not (r.get("dest_topic_action") == "create" and r.get("dest_topic_title"))
+        )
         pending = total - accepted - n_unassigned
         if total == 0:
             status = "No routes yet — add sources above."
@@ -1046,7 +1068,11 @@ class App(tk.Tk):
         if not name: messagebox.showerror("", "Enter a project name."); return
         if not self._b_routes:
             messagebox.showerror("", "No routes to save. Add sources first."); return
-        unassigned = [r for r in self._b_routes if not r.get("dest_topic_id")]
+        unassigned = [
+            r for r in self._b_routes
+            if not r.get("dest_topic_id")
+            and not (r.get("dest_topic_action") == "create" and r.get("dest_topic_title"))
+        ]
         if unassigned:
             messagebox.showerror("Unassigned routes",
                 f"{len(unassigned)} route(s) have no destination.\n"
@@ -1666,8 +1692,8 @@ class App(tk.Tk):
     # -- CLEAN ------------------------------------------------------------------
     def _clean_tab(self, parent):
         _, inner = make_scrollable(parent)
-        top = card(inner, "Clean existing topics", pady=12); top.pack(fill=tk.X, padx=20, pady=(16,8))
-        tk.Label(top, text="Find duplicate files already inside a destination group. Optionally remove the nearby preview images that belong to the duplicate upload.",
+        top = card(inner, "Clean exact duplicate files", pady=12); top.pack(fill=tk.X, padx=20, pady=(16,8))
+        tk.Label(top, text="Scans the real Telegram destination group and finds duplicate files in the same topic with the same name and size. Keeps the first copy and lets you delete the extras.",
                  bg=BG2, fg=MUTED, font=FONT_SM, wraplength=850, justify=tk.LEFT).pack(anchor="w", pady=(0,8))
         r1 = tk.Frame(top, bg=BG2); r1.pack(fill=tk.X, pady=3)
         tk.Label(r1, text="Group:", bg=BG2, fg=MUTED, font=FONT_SM, width=10, anchor="w").pack(side=tk.LEFT)
@@ -1677,15 +1703,15 @@ class App(tk.Tk):
         ttk.Button(r1, text="Load Topics", command=self._clean_load_topics).pack(side=tk.LEFT, padx=(0,8))
         ttk.Button(r1, text="Refresh Groups", command=self._load_groups).pack(side=tk.LEFT)
         opts = tk.Frame(top, bg=BG2); opts.pack(fill=tk.X, pady=(8,0))
-        self.c_include_previews = tk.BooleanVar(value=True)
-        tk.Checkbutton(opts, text="Also delete nearby preview images for duplicate files", variable=self.c_include_previews,
+        self.c_include_previews = tk.BooleanVar(value=False)
+        tk.Checkbutton(opts, text="Also delete nearby preview images for duplicate files (slower, optional)", variable=self.c_include_previews,
                        bg=BG2, fg=TEXT, activebackground=BG2, activeforeground=TEXT, selectcolor=BG3, font=FONT).pack(side=tk.LEFT)
         mid = card(inner, "Topics to scan", pady=10); mid.pack(fill=tk.X, padx=20, pady=8)
         srow = tk.Frame(mid, bg=BG2); srow.pack(fill=tk.X, pady=(0,5))
         self.c_topic_search_var = tk.StringVar()
         ttk.Entry(srow, textvariable=self.c_topic_search_var, width=38).pack(side=tk.LEFT, padx=(0,8))
         self.c_topic_search_var.trace_add("write", lambda *_: self._clean_filter_topics())
-        ttk.Button(srow, text="Select All", command=self._clean_select_all_topics).pack(side=tk.LEFT, padx=(0,8))
+        ttk.Button(srow, text="Select All Topics", command=self._clean_select_all_topics).pack(side=tk.LEFT, padx=(0,8))
         ttk.Button(srow, text="Clear", style="G.TButton", command=lambda: self.c_topic_list.selection_clear(0, tk.END)).pack(side=tk.LEFT)
         lrow = tk.Frame(mid, bg=BG2); lrow.pack(fill=tk.X)
         tsb = ttk.Scrollbar(lrow); tsb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1696,9 +1722,9 @@ class App(tk.Tk):
         self.c_status_lbl = tk.Label(mid, text="", bg=BG2, fg=MUTED, font=FONT_SM)
         self.c_status_lbl.pack(anchor="w", pady=(6,0))
         actions = tk.Frame(mid, bg=BG2); actions.pack(fill=tk.X, pady=(8,0))
-        ttk.Button(actions, text="Scan Duplicates", style="P.TButton", command=self._clean_scan).pack(side=tk.LEFT, padx=(0,8))
-        ttk.Button(actions, text="Delete Selected", style="D.TButton", command=self._clean_delete_selected).pack(side=tk.LEFT, padx=(0,8))
-        ttk.Button(actions, text="Select All Results", command=self._clean_select_all_results).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Scan Selected Topics", style="P.TButton", command=self._clean_scan).pack(side=tk.LEFT, padx=(0,8))
+        ttk.Button(actions, text="Delete Selected Duplicates", style="D.TButton", command=self._clean_delete_selected).pack(side=tk.LEFT, padx=(0,8))
+        ttk.Button(actions, text="Select All Duplicate Results", command=self._clean_select_all_results).pack(side=tk.LEFT)
         res = card(inner, "Duplicate results", pady=10); res.pack(fill=tk.BOTH, expand=True, padx=20, pady=(8,20))
         cols = ("topic", "file", "size", "keep", "delete", "previews")
         self.c_result_tree = ttk.Treeview(res, columns=cols, show="headings", height=12, selectmode="extended")
@@ -1847,7 +1873,7 @@ class App(tk.Tk):
         self.stop_btn=ttk.Button(r2,text="Stop",style="D.TButton",command=self._stop); self.stop_btn.pack(side=tk.LEFT,padx=10)
         self.stop_btn.state(["disabled"])
         self.prog_lbl=tk.Label(inner,text="",bg=BG,fg=SUCCESS,font=FONT_B)
-        tk.Label(top,text="Deep duplicate check is slower. Use only for files added to the destination by other means, not copied by this app.",
+        tk.Label(top,text="Deep duplicate check scans destination topics for files added outside the app. First scan builds a shared file index and can be slow; later scans only check new messages.",
                  bg=BG2,fg=MUTED,font=FONT_SM).pack(anchor="w",pady=(6,0))
         tk.Label(top,text="Convert image files to photos downloads and reuploads image-documents, so it is slower but avoids sending them as files.",
                  bg=BG2,fg=MUTED,font=FONT_SM).pack(anchor="w",pady=(2,0))
@@ -2343,6 +2369,19 @@ class App(tk.Tk):
                     self._log_r(("OK " if tag == "g" else "START ") + msg, tag)
                 elif "Progress:" in msg:
                     self._log_progress_r(msg); self._set_progress(msg)
+                elif msg.startswith("SUMMARY "):
+                    self._log_r("OK " + msg, "status"); self._set_progress(msg[8:])
+                elif msg.startswith(("Repair files complete.", "Repair complete.", "Repair links done:", "Repair files done:")):
+                    tag = "y" if re.search(r"[1-9]\d* errors", msg) else "g"
+                    self._log_r("OK " + msg, tag); self._set_progress(msg)
+                elif msg.startswith(("Repair files: copied", "Repair links: fixed")):
+                    self._log_r("OK " + msg, "g")
+                elif msg.startswith(("Repair files progress:", "Repair files: destination has")):
+                    self._log_r("STATUS " + msg, "status"); self._set_progress(msg)
+                elif msg.startswith(("Repair files: rebuilding", "Repair files: scanning", "Repair links:", "Clean scan:")):
+                    self._log_r(msg, "a")
+                elif msg.startswith(("  scanned", "Clean scan topic:")):
+                    self._log_r(msg, "d")
                 elif any(x in msg for x in ("ERROR","FATAL","PermissionError","protected")):
                     shown = msg if msg.startswith(("ERROR ", "FATAL ")) else "ERROR " + msg
                     self._log_r(shown, "r"); self._log_s(msg, "err")
